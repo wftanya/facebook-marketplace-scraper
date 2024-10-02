@@ -50,6 +50,12 @@ This program can be customized to your personal/organizational needs. For more i
 
 ### Features:
 - List of supported cities for scraping.
+- Scrape every 5 minutes.
 - User inputs for city, search query, and maximum price.
 - Submission button to start scraping.
 - Display of scraping results including number of results, images, prices, locations, and item URLs.
+
+### Running:
+- `streamlit run gui.py` in one terminal window
+- `python app.py` in another
+- Consider running the above in a virtual env. 
