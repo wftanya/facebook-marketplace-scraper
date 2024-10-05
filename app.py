@@ -46,27 +46,40 @@ page = None
 
 def initialize_browser():
     global browser, page
-    if browser is None:
-        playwright = sync_playwright().start()
-        browser = playwright.chromium.launch(headless=True)
-        page = browser.new_page()
+    try:
+      if browser is None:
+          playwright = sync_playwright().start()
+          browser = playwright.chromium.launch(headless=False, args=['--enable-logging', '--v=1'])
+          page = browser.new_page()
+    except Exception as e:
+      logger.error(f"Error initializing browser: {e}")
+      restart_browser()
 
 def login_and_goto_marketplace(initial_url, marketplace_url):
     global page
     page.goto(initial_url)
     time.sleep(2)
     try:
-        # If url does not contain "login", we assume we are logged in and redirect to marketplace
-        if "login" not in page.url:
-            page.goto(marketplace_url)
-            return
-        email_input = page.wait_for_selector('input[name="email"]').fill('tnyavdc@hotmail.com')
-        password_input = page.wait_for_selector('input[name="pass"]').fill('LubetoNancy111!!')
-        time.sleep(2)
-        login_button = page.wait_for_selector('button[name="login"]').click()
-        time.sleep(10)
-    except:
-      page.goto(marketplace_url)
+      # If url does not contain "login", we assume we are logged in and redirect to marketplace
+      if "login" not in page.url:
+          page.goto(marketplace_url)
+          return
+      email_input = page.wait_for_selector('input[name="email"]').fill('tnyavdc@hotmail.com')
+      password_input = page.wait_for_selector('input[name="pass"]').fill('LubetoNancy111!!')
+      time.sleep(2)
+      login_button = page.wait_for_selector('button[name="login"]').click()
+      time.sleep(10)
+    except Exception as e:
+      logger.error(f"Login error: {e}")
+      restart_browser()
+
+def restart_browser():
+    global browser, page
+    logger.warning("Restarting the browser due to crash or failure...")
+    if browser:
+        browser.close()
+    browser = None
+    initialize_browser()
 
 
 # Create a route to the root endpoint.
@@ -137,66 +150,72 @@ if __name__ == "__main__":
     )
 
 def crawl_query(city: str, query: str, max_price: int, max_results: int, suggested: bool):
-  marketplace_url = f'https://www.facebook.com/marketplace/{city}/search?query={query}&maxPrice={max_price}&daysSinceListed=1&sortBy=creation_time_descend'
-  initial_url = "https://www.facebook.com/login/device-based/regular/login/"
-  if suggested:
-    marketplace_url = f'https://www.facebook.com/marketplace/{city}/search?query={query}&maxPrice={max_price}&daysSinceListed=3'
+  global page
+  try:
+    marketplace_url = f'https://www.facebook.com/marketplace/{city}/search?query={query}&maxPrice={max_price}&daysSinceListed=1&sortBy=creation_time_descend'
+    initial_url = "https://www.facebook.com/login/device-based/regular/login/"
+    if suggested:
+      marketplace_url = f'https://www.facebook.com/marketplace/{city}/search?query={query}&maxPrice={max_price}&daysSinceListed=3'
 
-  # Initialize browser if not already initialized
-  initialize_browser()
+    # Initialize browser if not already initialized
+    initialize_browser()
 
-  login_and_goto_marketplace(initial_url, marketplace_url)
+    login_and_goto_marketplace(initial_url, marketplace_url)
 
-  # Get listings of particular item in a particular city for a particular price.
-  # Wait for the page to load.
-  time.sleep(5)
-  html = page.content()
-  soup = BeautifulSoup(html, 'html.parser')
-  parsed = []
-  listings = soup.find_all('div', class_='x9f619 x78zum5 x1r8uery xdt5ytf x1iyjqo2 xs83m0k x1e558r4 x150jy0e x1iorvi4 xjkvuk6 xnpuxes x291uyu x1uepa24')
+    # Get listings of particular item in a particular city for a particular price.
+    # Wait for the page to load.
+    time.sleep(5)
+    html = page.content()
+    soup = BeautifulSoup(html, 'html.parser')
+    parsed = []
+    listings = soup.find_all('div', class_='x9f619 x78zum5 x1r8uery xdt5ytf x1iyjqo2 xs83m0k x1e558r4 x150jy0e x1iorvi4 xjkvuk6 xnpuxes x291uyu x1uepa24')
 
-  for listing in listings:
-    # Get the item image.
-    image = listing.find('img', class_='xt7dq6l xl1xv1r x6ikm8r x10wlt62 xh8yej3')
-    if image is not None:
-      image = image['src']
+    for listing in listings:
+      # Get the item image.
+      image = listing.find('img', class_='xt7dq6l xl1xv1r x6ikm8r x10wlt62 xh8yej3')
+      if image is not None:
+        image = image['src']
 
-    # TODO: better way to grab these or move these classes to config. They change sometimes
-    # Get the item title from span.
-    title = listing.find('span', 'x1lliihq x6ikm8r x10wlt62 x1n2onr6')
-    if title is not None:
-      title = title.text
+      # TODO: better way to grab these or move these classes to config. They change sometimes
+      # Get the item title from span.
+      title = listing.find('span', 'x1lliihq x6ikm8r x10wlt62 x1n2onr6')
+      if title is not None:
+        title = title.text
 
-    # Get the item URL.
-    post_url = listing.find('a', class_='x1i10hfl xjbqb8w x1ejq31n xd10rxx x1sy0etr x17r0tee x972fbf xcfux6l x1qhh985 xm0m39n x9f619 x1ypdohk xt0psk2 xe8uvvx xdj266r x11i5rnm xat24cr x1mh8g0r xexx8yu x4uap5 x18d9i69 xkhd6sd x16tdsg8 x1hl2dhg xggy1nq x1a2a7pz x1heor9g x1sur9pj xkrqix3 x1s688f x1lku1pv')
-    if post_url is not None:
-      post_url = post_url['href']
+      # Get the item URL.
+      post_url = listing.find('a', class_='x1i10hfl xjbqb8w x1ejq31n xd10rxx x1sy0etr x17r0tee x972fbf xcfux6l x1qhh985 xm0m39n x9f619 x1ypdohk xt0psk2 xe8uvvx xdj266r x11i5rnm xat24cr x1mh8g0r xexx8yu x4uap5 x18d9i69 xkhd6sd x16tdsg8 x1hl2dhg xggy1nq x1a2a7pz x1heor9g x1sur9pj xkrqix3 x1s688f x1lku1pv')
+      if post_url is not None:
+        post_url = post_url['href']
 
-    # Only add the item if the title includes any of the query terms
-    query_parts = query.split(' ')
-    if title is not None and post_url is not None and image is not None and any(part.lower() in title.lower() for part in query_parts):
-      # Append the parsed data to the list.
-      parsed.append({
-          'image': image,
-          # 'location': location,
-          'title': title,
-          # 'price': price,
-          'post_url': post_url
-      })
+      # Only add the item if the title includes any of the query terms
+      query_parts = query.split(' ')
+      if title is not None and post_url is not None and image is not None and any(part.lower() in title.lower() for part in query_parts):
+        # Append the parsed data to the list.
+        parsed.append({
+            'image': image,
+            # 'location': location,
+            'title': title,
+            # 'price': price,
+            'post_url': post_url
+        })
 
-  # Return the parsed data as a JSON.
-  # TODO: put in a dict for query headings
-  result = []
-  # Grab only max results amount
-  parsed = parsed[:max_results]
-  for item in parsed:
-      result.append({
-          'name': item['title'],
-          # 'price': item['price'],
-          # 'location': item['location'],
-          'title': item['title'],
-          'image': item['image'],
-          'link': item['post_url']
-      })
+    # Return the parsed data as a JSON.
+    # TODO: put in a dict for query headings
+    result = []
+    # Grab only max results amount
+    parsed = parsed[:max_results]
+    for item in parsed:
+        result.append({
+            'name': item['title'],
+            # 'price': item['price'],
+            # 'location': item['location'],
+            'title': item['title'],
+            'image': item['image'],
+            'link': item['post_url']
+        })
 
-  return result
+    return result
+  except Exception as e:
+    logger.error(f"Error during crawl: {e}")
+    restart_browser()  # Restart on failure
+
