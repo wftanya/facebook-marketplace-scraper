@@ -50,6 +50,12 @@ This program can be customized to your personal/organizational needs. For more i
 
 ### Features:
 - List of supported cities for scraping.
-- User inputs for city, search query, and maximum price.
+- Scrape every 5 minutes
+- User inputs for city, multiple search query, and maximum price.
 - Submission button to start scraping.
 - Display of scraping results including number of results, images, prices, locations, and item URLs.
+
+### Debuging:
+- Not getting results? Try chagning `headless=False` in the code to see what's
+going on. Usually it's a case of Facebook forcing you to sign in. I find that
+as long as I am not running a VPN, sign in is not required.
