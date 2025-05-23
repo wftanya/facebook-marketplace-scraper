@@ -101,11 +101,12 @@ st.title("DingBot™ Facebook Scraper")
 st.subheader("Brought to you by Passivebot + WordForest")
 
 # Add a list of supported cities.
-supported_cities = ["Hamilton"] # TODO: more oNTARIO cities
+supported_cities = ["Hamilton", "Barrie", "Toronto"] # TODO: more oNTARIO cities
 
 # Take user input for the city, query, and max price.
 city = st.selectbox("City", supported_cities, 0)
-query = st.text_input("Query (comma,between,multiple,queries)", "Digimon,Free VHS,Horror VHS")
+query = st.text_input("Query (comma,between,multiple,queries)", "Horror VHS,Digimon")
+# TODO: don't scrape until there is an input. Ensure that subsequent auto scrapes use the input
 max_price = st.text_input("Max Price ($)", "1000")
 # This value should be calibrated to your queries. Facebook sometimes is very lax about what they think
 # is related to your search query.
@@ -126,7 +127,7 @@ if submit:
   crawl()
 
 # Schedule the scraper to run every 5 minutes # TODO: interval to variable
-schedule.every(5).minutes.do(crawl)
+schedule.every(3).minutes.do(crawl)
 # Timer message
 countdown_timer() # TODO: FIRST auto scrape not working?
 

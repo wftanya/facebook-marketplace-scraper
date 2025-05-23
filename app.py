@@ -49,7 +49,7 @@ def initialize_browser():
     try:
       if browser is None:
           playwright = sync_playwright().start()
-          browser = playwright.chromium.launch(headless=True, args=['--enable-logging', '--v=1'])
+          browser = playwright.chromium.launch(headless=False, args=['--enable-logging', '--v=1'])
           page = browser.new_page()
     except Exception as e:
       logger.error(f"Error initializing browser: {e}")
@@ -64,14 +64,37 @@ def login_and_goto_marketplace(initial_url, marketplace_url):
       if "login" not in page.url:
           page.goto(marketplace_url)
           return
-      email_input = page.wait_for_selector('input[name="email"]').fill('tnyavdc@hotmail.com')
-      password_input = page.wait_for_selector('input[name="pass"]').fill('LubetoNancy111!!')
-      time.sleep(2)
-      login_button = page.wait_for_selector('button[name="login"]').click()
-      time.sleep(10)
+      # If not logged in, go to Facebook homepage and wait for manual login
+      page.goto("https://www.facebook.com")
+      wait_for_user_login(page)
+      
+      # After login, navigate to marketplace
+      page.goto(marketplace_url)
+      time.sleep(5)  # Wait for marketplace to load
+        
     except Exception as e:
       logger.error(f"Login error: {e}")
       restart_browser()
+
+def wait_for_user_login(page):
+    st.info("Please log in manually in the opened Chromium window...")
+    print("Please login manually in the browser window...")
+
+    # Wait for navigation after form submission
+    with page.expect_navigation(timeout=600_000):  # wait up to 10 minutes
+        # Wait for the login button to appear
+        page.wait_for_selector('button[name="login"]')
+        print("Login button is available. Waiting for user to submit the form...")
+
+        # Optionally: Wait until button is actually clicked
+        page.locator('button[name="login"]').wait_for(state="detached", timeout=600_000)
+
+    print("Login detected, proceeding with scraping...")
+    # TODO: this is not automatically going to marketplace, have to hit force run again.
+    # If we can't get it auto redirecting we should just have a separate login button
+ 
+def goto_marketplace(marketplace_url):
+    page.goto(marketplace_url)
 
 def restart_browser():
     global browser, page
@@ -98,7 +121,9 @@ def crawl_facebook_marketplace(city: str, query: str, max_price: int, max_result
     # Define dictionary of cities from the facebook marketplace directory for United States.
     # https://m.facebook.com/marketplace/directory/US/?_se_imp=0oey5sMRMSl7wluQZ
     cities = {
-        'Hamilton': 'hamilton'  # TODO: more Ontario cities
+        'Hamilton': 'hamilton',  # TODO: more Ontario cities
+        'Barrie': 'barrie',
+        'Toronto': 'toronto'
     }
     # If the city is in the cities dictionary...
     if city in cities:
@@ -118,6 +143,7 @@ def crawl_facebook_marketplace(city: str, query: str, max_price: int, max_result
     query_list = query.split(',')
     for query in query_list:
       try:
+        # TODO: umm it seems to only consider the query the first time around? Or is that because im not signing in anymore?
         recent_query_results = crawl_query(city, query, max_price, max_results_per_query, False)
         suggested_results =  crawl_query(city, query, max_price, max_results_per_query, True)
       except:
@@ -159,6 +185,7 @@ def crawl_query(city: str, query: str, max_price: int, max_results: int, suggest
     initialize_browser()
 
     login_and_goto_marketplace(initial_url, marketplace_url)
+    # goto_marketplace(marketplace_url) # TODO: if login captcha locked.. comment above and uncomment this
 
     # Get listings of particular item in a particular city for a particular price.
     # Wait for the page to load.
@@ -170,7 +197,7 @@ def crawl_query(city: str, query: str, max_price: int, max_results: int, suggest
 
     for listing in listings:
       # Get the item image.
-      image = listing.find('img', class_='xt7dq6l xl1xv1r x6ikm8r x10wlt62 xh8yej3')
+      image = listing.find('img', class_='x168nmei x13lgxp2 x5pf9jr xo71vjh xt7dq6l xl1xv1r x6ikm8r x10wlt62 xh8yej3')
       if image is not None:
         image = image['src']
 
@@ -181,7 +208,7 @@ def crawl_query(city: str, query: str, max_price: int, max_results: int, suggest
         title = title.text
 
       # Get the item URL.
-      post_url = listing.find('a', class_='x1i10hfl xjbqb8w x1ejq31n xd10rxx x1sy0etr x17r0tee x972fbf xcfux6l x1qhh985 xm0m39n x9f619 x1ypdohk xt0psk2 xe8uvvx xdj266r x11i5rnm xat24cr x1mh8g0r xexx8yu x4uap5 x18d9i69 xkhd6sd x16tdsg8 x1hl2dhg xggy1nq x1a2a7pz x1heor9g x1sur9pj xkrqix3 x1s688f x1lku1pv')
+      post_url = listing.find('a', class_='x1i10hfl xjbqb8w x1ejq31n xd10rxx x1sy0etr x17r0tee x972fbf xcfux6l x1qhh985 xm0m39n x9f619 x1ypdohk xt0psk2 xe8uvvx xdj266r x11i5rnm xat24cr x1mh8g0r xexx8yu x4uap5 x18d9i69 xkhd6sd x16tdsg8 x1hl2dhg xggy1nq x1a2a7pz x1heor9g xkrqix3 x1sur9pj x1s688f x1lku1pv')
       if post_url is not None:
         post_url = post_url['href']
 
