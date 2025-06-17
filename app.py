@@ -193,11 +193,11 @@ def crawl_query(city: str, query: str, max_price: int, max_results: int, suggest
     html = page.content()
     soup = BeautifulSoup(html, 'html.parser')
     parsed = []
-    listings = soup.find_all('div', class_='x9f619 x78zum5 x1r8uery xdt5ytf x1iyjqo2 xs83m0k x1e558r4 x150jy0e x1iorvi4 xjkvuk6 xnpuxes x291uyu x1uepa24')
+    listings = soup.find_all('div', class_='x9f619 x78zum5 x1r8uery xdt5ytf x1iyjqo2 xs83m0k x135b78x x11lfxj5 x1iorvi4 xjkvuk6 xnpuxes x1cjf5ee x17dddeq')
 
     for listing in listings:
       # Get the item image.
-      image = listing.find('img', class_='x168nmei x13lgxp2 x5pf9jr xo71vjh xt7dq6l xl1xv1r x6ikm8r x10wlt62 xh8yej3')
+      image = listing.find('img', class_='x15mokao x1ga7v0g x16uus16 xbiv7yw xt7dq6l xl1xv1r x6ikm8r x10wlt62 xh8yej3')
       if image is not None:
         image = image['src']
 
@@ -208,7 +208,7 @@ def crawl_query(city: str, query: str, max_price: int, max_results: int, suggest
         title = title.text
 
       # Get the item URL.
-      post_url = listing.find('a', class_='x1i10hfl xjbqb8w x1ejq31n xd10rxx x1sy0etr x17r0tee x972fbf xcfux6l x1qhh985 xm0m39n x9f619 x1ypdohk xt0psk2 xe8uvvx xdj266r x11i5rnm xat24cr x1mh8g0r xexx8yu x4uap5 x18d9i69 xkhd6sd x16tdsg8 x1hl2dhg xggy1nq x1a2a7pz x1heor9g xkrqix3 x1sur9pj x1s688f x1lku1pv')
+      post_url = listing.find('a', class_='x1i10hfl xjbqb8w x1ejq31n x18oe1m7 x1sy0etr xstzfhl x972fbf x10w94by x1qhh985 x14e42zd x9f619 x1ypdohk xt0psk2 xe8uvvx xdj266r x14z9mp xat24cr x1lziwak xexx8yu xyri2b x18d9i69 x1c1uobl x16tdsg8 x1hl2dhg xggy1nq x1a2a7pz x1heor9g xkrqix3 x1sur9pj x1s688f x1lku1pv')
       if post_url is not None:
         post_url = post_url['href']
 
