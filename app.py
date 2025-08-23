@@ -22,6 +22,18 @@ import json
 # The uvicorn library is used to run the API.
 import uvicorn
 from fastapi.middleware.cors import CORSMiddleware
+# The logging library is used for error logging.
+import logging
+import traceback
+# Threading and queue for Playwright worker
+import threading
+import queue
+from concurrent.futures import ThreadPoolExecutor
+import uuid
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
                  
 # Create an instance of the FastAPI class.
 app = FastAPI()
@@ -40,69 +52,213 @@ app.add_middleware(
     allow_headers=["Content-Type"],
 )
 
-# Global variables for the browser and page
+# Clean up browser resources on app shutdown
+@app.on_event("shutdown")
+async def shutdown_event():
+    shutdown_playwright_worker()
+    logger.info("Application shutdown - playwright worker stopped")
+
+# Playwright Worker System to avoid asyncio conflicts
+job_queue = queue.Queue()
+result_queues = {}
+playwright_worker_thread = None
+playwright_shutdown_event = threading.Event()
+
+# Global browser variables (managed by worker thread)
 browser = None
 page = None
+playwright_instance = None
 
-def initialize_browser():
-    global browser, page
+def playwright_worker():
+    """Dedicated worker thread for all Playwright operations"""
+    global browser, page, playwright_instance
+    
+    logger.info("Playwright worker thread started")
+    
+    while not playwright_shutdown_event.is_set():
+        try:
+            # Wait for jobs with timeout to allow clean shutdown
+            job = job_queue.get(timeout=1.0)
+            job_id = job.get('job_id')
+            action = job.get('action')
+            
+            try:
+                if action == 'crawl':
+                    # Initialize browser if needed
+                    if browser is None or page is None:
+                        initialize_browser_worker()
+                    
+                    # Perform the crawl
+                    result = crawl_query_worker(
+                        job['city'], 
+                        job['query'], 
+                        job['max_price'], 
+                        job['max_results'], 
+                        job['suggested']
+                    )
+                    
+                    # Send result back
+                    if job_id in result_queues:
+                        result_queues[job_id].put({'success': True, 'data': result})
+                        
+                elif action == 'shutdown':
+                    logger.info("Playwright worker received shutdown signal")
+                    cleanup_browser_resources_worker()
+                    break
+                    
+            except Exception as e:
+                logger.error(f"Error in playwright worker: {e}")
+                if job_id in result_queues:
+                    result_queues[job_id].put({'success': False, 'error': str(e)})
+                
+            finally:
+                job_queue.task_done()
+                
+        except queue.Empty:
+            continue  # Timeout, check shutdown flag
+        except Exception as e:
+            logger.error(f"Unexpected error in playwright worker: {e}")
+    
+    logger.info("Playwright worker thread stopping")
+
+def initialize_browser_worker():
+    """Initialize browser in worker thread context"""
+    global browser, page, playwright_instance
     try:
-      if browser is None:
-          playwright = sync_playwright().start()
-          browser = playwright.chromium.launch(headless=False, args=['--enable-logging', '--v=1'])
-          page = browser.new_page()
+        if browser is None:
+            playwright_instance = sync_playwright().start()
+            # Use persistent context to maintain login sessions across crashes
+            browser = playwright_instance.chromium.launch_persistent_context(
+                user_data_dir="fb_profile",  # Persistent user data directory
+                headless=True,
+                args=[
+                    '--enable-logging', 
+                    '--v=1',
+                    '--no-first-run',
+                    '--disable-blink-features=AutomationControlled',
+                    '--disable-web-security',
+                    '--allow-running-insecure-content'
+                ]
+            )
+            # For persistent context, browser acts as both browser and page context
+            # Get the first page or create one if none exists
+            if len(browser.pages) > 0:
+                page = browser.pages[0]
+            else:
+                page = browser.new_page()
+            logger.info("Browser initialized successfully with persistent context in worker thread")
     except Exception as e:
-      logger.error(f"Error initializing browser: {e}")
-      restart_browser()
+        logger.error(f"Error initializing browser in worker: {e}")
+        cleanup_browser_resources_worker()
+        raise e
 
-def login_and_goto_marketplace(initial_url, marketplace_url):
-    global page
-    page.goto(initial_url)
-    time.sleep(2)
+def cleanup_browser_resources_worker():
+    """Clean up browser resources in worker thread context"""
+    global browser, page, playwright_instance
     try:
-      # If url does not contain "login", we assume we are logged in and redirect to marketplace
-      if "login" not in page.url:
-          page.goto(marketplace_url)
-          return
-      # If not logged in, go to Facebook homepage and wait for manual login
-      page.goto("https://www.facebook.com")
-      wait_for_user_login(page)
-      
-      # After login, navigate to marketplace
-      page.goto(marketplace_url)
-      time.sleep(5)  # Wait for marketplace to load
+        if browser:
+            browser.close()
+    except Exception as e:
+        logger.warning(f"Error closing browser in worker: {e}")
+    
+    try:
+        if playwright_instance:
+            playwright_instance.stop()
+    except Exception as e:
+        logger.warning(f"Error stopping playwright in worker: {e}")
+    
+    browser = None
+    page = None
+    playwright_instance = None
+
+def start_playwright_worker():
+    """Start the playwright worker thread"""
+    global playwright_worker_thread
+    if playwright_worker_thread is None or not playwright_worker_thread.is_alive():
+        playwright_shutdown_event.clear()
+        playwright_worker_thread = threading.Thread(target=playwright_worker, daemon=True)
+        playwright_worker_thread.start()
+        logger.info("Playwright worker thread started")
+
+def shutdown_playwright_worker():
+    """Shutdown the playwright worker thread"""
+    global playwright_worker_thread
+    if playwright_worker_thread and playwright_worker_thread.is_alive():
+        # Signal shutdown
+        playwright_shutdown_event.set()
+        job_queue.put({'action': 'shutdown'})
+        
+        # Wait for thread to finish
+        playwright_worker_thread.join(timeout=10)
+        if playwright_worker_thread.is_alive():
+            logger.warning("Playwright worker thread did not shut down cleanly")
+        else:
+            logger.info("Playwright worker thread shut down successfully")
+
+# Start worker on import
+start_playwright_worker()
+
+def login_and_goto_marketplace_worker(initial_url, marketplace_url):
+    """Worker thread version of login function"""
+    global page
+    try:
+        if page is None:
+            logger.error("Page is None, cannot proceed with login")
+            return
+            
+        page.goto(initial_url)
+        time.sleep(2)
+        
+        # If url does not contain "login", we assume we are logged in and redirect to marketplace
+        if "login" not in page.url:
+            page.goto(marketplace_url)
+            return
+            
+        # If not logged in, go to Facebook homepage and wait for manual login
+        page.goto("https://www.facebook.com")
+        wait_for_user_login(page)
+        
+        # After login, navigate to marketplace
+        page.goto(marketplace_url)
+        time.sleep(5)  # Wait for marketplace to load
         
     except Exception as e:
-      logger.error(f"Login error: {e}")
-      restart_browser()
+        logger.error(f"Login error in worker: {e}")
+        raise e
+
+def restart_browser_worker():
+    """Worker thread version of browser restart"""
+    global browser, page
+    logger.warning("Restarting browser in worker thread...")
+    
+    # Clean up existing resources
+    cleanup_browser_resources_worker()
+    
+    # Try to initialize browser once
+    try:
+        initialize_browser_worker()
+        logger.info("Browser restarted successfully in worker thread")
+    except Exception as e:
+        logger.error(f"Failed to restart browser in worker thread: {e}")
+        raise e
 
 def wait_for_user_login(page):
-    st.info("Please log in manually in the opened Chromium window...")
-    print("Please login manually in the browser window...")
+    print("Please log in manually in the opened Chromium window...")
 
-    # Wait for navigation after form submission
-    with page.expect_navigation(timeout=600_000):  # wait up to 10 minutes
-        # Wait for the login button to appear
-        page.wait_for_selector('button[name="login"]')
-        print("Login button is available. Waiting for user to submit the form...")
+    try:
+        # Wait for navigation after form submission
+        with page.expect_navigation(timeout=600_000):  # wait up to 10 minutes
+            # Wait for the login button to appear
+            page.wait_for_selector('button[name="login"]')
+            print("Login button is available. Waiting for user to submit the form...")
 
-        # Optionally: Wait until button is actually clicked
-        page.locator('button[name="login"]').wait_for(state="detached", timeout=600_000)
+            # Optionally: Wait until button is actually clicked
+            page.locator('button[name="login"]').wait_for(state="detached", timeout=600_000)
 
-    print("Login detected, proceeding with scraping...")
-    # TODO: this is not automatically going to marketplace, have to hit force run again.
-    # If we can't get it auto redirecting we should just have a separate login button
- 
-def goto_marketplace(marketplace_url):
-    page.goto(marketplace_url)
-
-def restart_browser():
-    global browser, page
-    logger.warning("Restarting the browser due to crash or failure...")
-    if browser:
-        browser.close()
-    browser = None
-    initialize_browser()
+        print("Login detected, proceeding with scraping...")
+    except Exception as e:
+        logger.error(f"Error waiting for user login: {e}")
+        raise e
 
 
 # Create a route to the root endpoint.
@@ -143,18 +299,33 @@ def crawl_facebook_marketplace(city: str, query: str, max_price: int, max_result
     query_list = query.split(',')
     for query in query_list:
       try:
-        # TODO: umm it seems to only consider the query the first time around? Or is that because im not signing in anymore?
+        # Use the new robust crawling method
         recent_query_results = crawl_query(city, query, max_price, max_results_per_query, False)
-        suggested_results =  crawl_query(city, query, max_price, max_results_per_query, True)
-      except:
+        suggested_results = crawl_query(city, query, max_price, max_results_per_query, True)
+      except Exception as e:
+        logger.error(f"Error crawling query '{query}': {e}")
         recent_query_results = []
         suggested_results = []
 
       recent_query_results_urls = [item["link"] for item in recent_query_results]
       suggested_results_urls = [item["link"] for item in suggested_results]
 
-      # If the items appear in both recent and suggested, put them in the top of the list
+      # If the items appear in both recent and suggested, mark them as "hot"
       common_items = set(recent_query_results_urls) & set(suggested_results_urls)
+      logger.info(f"Common item links for query '{query}': {list(common_items)}")
+
+      # Add metadata to indicate item type
+      for item in recent_query_results:
+        if item["link"] in common_items:
+          item["item_type"] = "hot"  # Appears in both recent and suggested
+        else:
+          item["item_type"] = "new"  # Only in recent
+
+      for item in suggested_results:
+        if item["link"] in common_items:
+          item["item_type"] = "hot"  # Appears in both recent and suggested
+        else:
+          item["item_type"] = "suggested"  # Only in suggested
 
       consolidated_query_result_urls = list(common_items) + [item for item in recent_query_results_urls + suggested_results_urls if item not in list(common_items)]
       consolidated_query_results = [item for item in recent_query_results + suggested_results if item["link"] in consolidated_query_result_urls]
@@ -174,73 +345,262 @@ if __name__ == "__main__":
     )
 
 def crawl_query(city: str, query: str, max_price: int, max_results: int, suggested: bool):
-  global page
-  try:
-    marketplace_url = f'https://www.facebook.com/marketplace/{city}/search?query={query}&maxPrice={max_price}&daysSinceListed=1&sortBy=creation_time_descend'
-    initial_url = "https://www.facebook.com/login/device-based/regular/login/"
-    if suggested:
-      marketplace_url = f'https://www.facebook.com/marketplace/{city}/search?query={query}&maxPrice={max_price}&daysSinceListed=3'
+    """Submit crawl job to worker thread and wait for result"""
+    job_id = str(uuid.uuid4())
+    result_queue = queue.Queue()
+    result_queues[job_id] = result_queue
+    
+    try:
+        # Submit job to worker thread
+        job = {
+            'job_id': job_id,
+            'action': 'crawl',
+            'city': city,
+            'query': query,
+            'max_price': max_price,
+            'max_results': max_results,
+            'suggested': suggested
+        }
+        
+        job_queue.put(job)
+        
+        # Wait for result with timeout
+        try:
+            result = result_queue.get(timeout=120)  # 2 minute timeout
+            if result['success']:
+                return result['data']
+            else:
+                logger.error(f"Crawl failed: {result['error']}")
+                return []
+        except queue.Empty:
+            logger.error("Crawl job timed out")
+            return []
+            
+    finally:
+        # Clean up result queue
+        if job_id in result_queues:
+            del result_queues[job_id]
 
-    # Initialize browser if not already initialized
-    initialize_browser()
+def crawl_query_worker(city: str, query: str, max_price: int, max_results: int, suggested: bool):
+    """Actual crawl implementation running in worker thread"""
+    global page
+    try:
+        marketplace_url = f'https://www.facebook.com/marketplace/{city}/search?query={query}&maxPrice={max_price}&daysSinceListed=1&sortBy=creation_time_descend'
+        initial_url = "https://www.facebook.com/login/device-based/regular/login/"
+        if suggested:
+            marketplace_url = f'https://www.facebook.com/marketplace/{city}/search?query={query}&maxPrice={max_price}&daysSinceListed=3'
 
-    login_and_goto_marketplace(initial_url, marketplace_url)
-    # goto_marketplace(marketplace_url) # TODO: if login captcha locked.. comment above and uncomment this
+        login_and_goto_marketplace_worker(initial_url, marketplace_url)
+        
+        # Get listings of particular item in a particular city for a particular price.
+        # Wait for the page to load.
+        time.sleep(5)
+        html = page.content()
+        soup = BeautifulSoup(html, 'html.parser')
+        parsed = []
+        
+        # More robust approach: Use multiple selectors as fallbacks
+        listings = find_marketplace_listings(soup)
 
-    # Get listings of particular item in a particular city for a particular price.
-    # Wait for the page to load.
-    time.sleep(5)
-    html = page.content()
-    soup = BeautifulSoup(html, 'html.parser')
-    parsed = []
-    listings = soup.find_all('div', class_='x9f619 x78zum5 x1r8uery xdt5ytf x1iyjqo2 xs83m0k x135b78x x11lfxj5 x1iorvi4 xjkvuk6 xnpuxes x1cjf5ee x17dddeq')
+        for listing in listings:
+            # Get the item image using multiple strategies
+            image = find_listing_image(listing)
+            
+            # Get the item title using multiple strategies
+            title = find_listing_title(listing)
 
+            # Get the item URL using multiple strategies
+            post_url = find_listing_url(listing)
+
+            # Only add the item if the title includes any of the query terms
+            query_parts = query.split(' ')
+            if title is not None and post_url is not None and image is not None and any(part.lower() in title.lower() for part in query_parts):
+                # Append the parsed data to the list.
+                parsed.append({
+                    'image': image,
+                    'title': title,
+                    'post_url': post_url
+                })
+
+        # Return the parsed data as a JSON.
+        result = []
+        # Grab only max results amount
+        parsed = parsed[:max_results]
+        for item in parsed:
+            result.append({
+                'name': item['title'],
+                'title': item['title'],
+                'image': item['image'],
+                'link': item['post_url']
+            })
+
+        return result
+    except Exception as e:
+        logger.error(f"Error during crawl in worker: {e}")
+        # Try to restart browser in worker thread
+        try:
+            restart_browser_worker()
+        except Exception as restart_error:
+            logger.error(f"Failed to restart browser in worker: {restart_error}")
+        return []  # Return empty results instead of crashing
+
+def crawl_query_with_playwright(city: str, query: str, max_price: int, max_results: int, suggested: bool):
+    """Alternative approach - now also uses worker thread system"""
+    # This function now just calls the main crawl_query which uses the worker
+    return crawl_query(city, query, max_price, max_results, suggested)
+
+def find_marketplace_listings(soup):
+    """Find marketplace listings using multiple strategies."""
+    # Strategy 1: Look for divs that contain both an image and a link (common marketplace pattern)
+    listings = soup.find_all('div', lambda value: value and len(value.split()) > 10)  # Divs with many classes
+    
+    # Filter to only divs that contain both an image and a link
+    marketplace_listings = []
     for listing in listings:
-      # Get the item image.
-      image = listing.find('img', class_='x15mokao x1ga7v0g x16uus16 xbiv7yw xt7dq6l xl1xv1r x6ikm8r x10wlt62 xh8yej3')
-      if image is not None:
-        image = image['src']
+        has_image = listing.find('img') is not None
+        has_link = listing.find('a') is not None
+        if has_image and has_link:
+            marketplace_listings.append(listing)
+    
+    # Strategy 2: If no listings found, try a broader search
+    if not marketplace_listings:
+        # Look for any div containing marketplace-like content
+        all_divs = soup.find_all('div')
+        for div in all_divs:
+            img = div.find('img')
+            link = div.find('a')
+            if img and link and img.get('src') and link.get('href'):
+                # Check if the link looks like a marketplace item
+                href = link.get('href', '')
+                if '/marketplace/item/' in href or 'marketplace' in href:
+                    marketplace_listings.append(div)
+    
+    # Fallback: Use configurable selectors to find listings
+    if not marketplace_listings and 'FALLBACK_SELECTORS' in globals():
+        for selector in FALLBACK_SELECTORS['listings']:
+            listings = soup.select(selector)
+            for listing in listings:
+                if listing not in marketplace_listings:
+                    marketplace_listings.append(listing)
+            if marketplace_listings:
+                break
+    
+    return marketplace_listings
 
-      # TODO: better way to grab these or move these classes to config. They change sometimes
-      # Get the item title from span.
-      title = listing.find('span', 'x1lliihq x6ikm8r x10wlt62 x1n2onr6')
-      if title is not None:
-        title = title.text
+def find_listing_image(listing):
+    """Find the image URL using multiple strategies."""
+    # Strategy 1: Look for any img tag with src
+    img_tags = listing.find_all('img')
+    for img in img_tags:
+        src = img.get('src')
+        if src and ('facebook' in src or 'fbcdn' in src or src.startswith('https://')):
+            return src
+    
+    # Strategy 2: Look for img with alt text or specific attributes
+    img_with_alt = listing.find('img', attrs={'alt': True})
+    if img_with_alt and img_with_alt.get('src'):
+        return img_with_alt.get('src')
+    
+    # Fallback: Use configurable selectors to find images
+    if 'FALLBACK_SELECTORS' in globals():
+        for selector in FALLBACK_SELECTORS['images']:
+            img = listing.select_one(selector)
+            if img and img.get('src'):
+                return img.get('src')
+    
+    return None
 
-      # Get the item URL.
-      post_url = listing.find('a', class_='x1i10hfl xjbqb8w x1ejq31n x18oe1m7 x1sy0etr xstzfhl x972fbf x10w94by x1qhh985 x14e42zd x9f619 x1ypdohk xt0psk2 xe8uvvx xdj266r x14z9mp xat24cr x1lziwak xexx8yu xyri2b x18d9i69 x1c1uobl x16tdsg8 x1hl2dhg xggy1nq x1a2a7pz x1heor9g xkrqix3 x1sur9pj x1s688f x1lku1pv')
-      if post_url is not None:
-        post_url = post_url['href']
+def find_listing_title(listing):
+    """Find the listing title using multiple strategies."""
+    # Strategy 1: Look for span elements with text content
+    spans = listing.find_all('span')
+    for span in spans:
+        text = span.get_text(strip=True)
+        if text and len(text) > 5 and len(text) < 200:  # Reasonable title length
+            # Skip common UI elements
+            if not any(skip in text.lower() for skip in ['$', 'price', 'location', 'see more', 'show more']):
+                return text
+    
+    # Strategy 2: Look for any text in links
+    links = listing.find_all('a')
+    for link in links:
+        text = link.get_text(strip=True)
+        if text and len(text) > 5 and len(text) < 200:
+            return text
+    
+    # Strategy 3: Look for divs with text content
+    divs = listing.find_all('div')
+    for div in divs:
+        text = div.get_text(strip=True)
+        if text and len(text) > 5 and len(text) < 200:
+            # Make sure it's not a nested element with lots of content
+            if len(div.find_all()) < 3:
+                return text
+    
+    # Fallback: Use configurable selectors to find titles
+    if 'FALLBACK_SELECTORS' in globals():
+        for selector in FALLBACK_SELECTORS['titles']:
+            title_element = listing.select_one(selector)
+            if title_element and title_element.get_text(strip=True):
+                return title_element.get_text(strip=True)
+    
+    return None
 
-      # Only add the item if the title includes any of the query terms
-      query_parts = query.split(' ')
-      if title is not None and post_url is not None and image is not None and any(part.lower() in title.lower() for part in query_parts):
-        # Append the parsed data to the list.
-        parsed.append({
-            'image': image,
-            # 'location': location,
-            'title': title,
-            # 'price': price,
-            'post_url': post_url
-        })
+def find_listing_url(listing):
+    """Find the listing URL using multiple strategies."""
+    # Strategy 1: Look for links that go to marketplace items
+    links = listing.find_all('a')
+    for link in links:
+        href = link.get('href')
+        if href:
+            # Make sure it's a marketplace item link
+            if '/marketplace/item/' in href or 'marketplace' in href:
+                # Convert relative URLs to absolute
+                if href.startswith('/'):
+                    href = 'https://www.facebook.com' + href
+                return href
+    
+    # Strategy 2: Look for any link that might be the main item link
+    for link in links:
+        href = link.get('href')
+        if href and href.startswith('https://www.facebook.com'):
+            return href
+    
+    # Fallback: Use configurable selectors to find links
+    if 'FALLBACK_SELECTORS' in globals():
+        for selector in FALLBACK_SELECTORS['links']:
+            link_element = listing.select_one(selector)
+            if link_element and link_element.get('href'):
+                href = link_element.get('href')
+                # Convert relative URLs to absolute
+                if href.startswith('/'):
+                    href = 'https://www.facebook.com' + href
+                return href
+    
+    return None
 
-    # Return the parsed data as a JSON.
-    # TODO: put in a dict for query headings
-    result = []
-    # Grab only max results amount
-    parsed = parsed[:max_results]
-    for item in parsed:
-        result.append({
-            'name': item['title'],
-            # 'price': item['price'],
-            # 'location': item['location'],
-            'title': item['title'],
-            'image': item['image'],
-            'link': item['post_url']
-        })
-
-    return result
-  except Exception as e:
-    logger.error(f"Error during crawl: {e}")
-    restart_browser()  # Restart on failure
+# Configuration for fallback selectors (can be updated if needed)
+FALLBACK_SELECTORS = {
+    'listings': [
+        'div[role="article"]',
+        'div[data-testid*="marketplace"]',
+        'div:has(img):has(a[href*="marketplace"])',
+        # Add more fallback selectors as needed
+    ],
+    'images': [
+        'img[src*="fbcdn"]',
+        'img[src*="facebook"]',
+        'img[alt]',
+    ],
+    'links': [
+        'a[href*="/marketplace/item/"]',
+        'a[href*="marketplace"]',
+        'a[role="link"]',
+    ],
+    'titles': [
+        'span:not(:empty)',
+        'div:not(:empty)',
+        'h1, h2, h3, h4, h5, h6',
+    ]
+}
 
