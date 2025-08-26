@@ -145,8 +145,7 @@ def crawl():  # Get current values from Streamlit widgets instead of global vari
                 listing_url = f"https://www.facebook.com{listing_url}"
             elif not listing_url.startswith('http'):
                 listing_url = f"https://www.facebook.com/{listing_url}"
-            
-            # Determine item type and visual indicators
+              # Determine item type and visual indicators
             item_type = item.get('item_type', 'unknown')
             if item_type == 'hot':
                 icon = "🔥"
@@ -163,6 +162,12 @@ def crawl():  # Get current values from Streamlit widgets instead of global vari
                 badge_color = "#4444ff"
                 badge_text = "SUGGESTED"
                 title_prefix = "💡 "
+            elif item_type == 'recent':
+                # No special styling for recent items without "just listed" pill
+                icon = ""
+                badge_color = ""
+                badge_text = ""
+                title_prefix = ""
             else:
                 icon = ""
                 badge_color = "#888888"
@@ -178,14 +183,16 @@ def crawl():  # Get current values from Streamlit widgets instead of global vari
             
             # Make image larger for full-width layout and clickable
             img_url = item["image"]
-            
-            # Add border styling based on item type
+              # Add border styling based on item type
             if item_type == 'hot':
                 border_style = "border: 3px solid #ff4444; border-radius: 8px;"
             elif item_type == 'new':
                 border_style = "border: 2px solid #44ff44; border-radius: 8px;"
             elif item_type == 'suggested':
                 border_style = "border: 2px solid #4444ff; border-radius: 8px;"
+            elif item_type == 'recent':
+                # No special border for recent items without "just listed" pill
+                border_style = ""
             else:
                 border_style = ""
             st.markdown(f'<a href="{listing_url}" target="_blank"><img src="{img_url}" width="350" style="cursor: pointer; max-width: 100%; {border_style}"></a>', unsafe_allow_html=True)
@@ -210,7 +217,7 @@ supported_cities = ["Hamilton", "Barrie", "Toronto"] # TODO: more oNTARIO cities
 
 # Take user input for the city, query, and max price.
 city = st.selectbox("City", supported_cities, 0, key='city')
-query = st.text_input("Query (comma,between,multiple,queries)", "Horror VHS,Guitar", key='query')
+query = st.text_input("Query (comma,between,multiple,queries)", "Horror VHS,Digimon", key='query')
 # TODO: don't scrape until there is an input. Ensure that subsequent auto scrapes use the input
 max_price = st.text_input("Max Price ($)", "1000", key='max_price')
 # This value should be calibrated to your queries. Facebook sometimes is very lax about what they think

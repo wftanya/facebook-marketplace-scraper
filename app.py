@@ -84,9 +84,9 @@ def playwright_worker():
             
             try:
                 if action == 'crawl':
-                    # Initialize browser if needed
+                    # Initialize browser if needed - start in headless mode by default
                     if browser is None or page is None:
-                        initialize_browser_worker()
+                        initialize_browser_worker(headless=True)
                     
                     # Perform the crawl
                     result = crawl_query_worker(
@@ -121,7 +121,7 @@ def playwright_worker():
     
     logger.info("Playwright worker thread stopping")
 
-def initialize_browser_worker():
+def initialize_browser_worker(headless=True):
     """Initialize browser in worker thread context"""
     global browser, page, playwright_instance
     try:
@@ -130,7 +130,7 @@ def initialize_browser_worker():
             # Use persistent context to maintain login sessions across crashes
             browser = playwright_instance.chromium.launch_persistent_context(
                 user_data_dir="fb_profile",  # Persistent user data directory
-                headless=True,
+                headless=headless,
                 args=[
                     '--enable-logging', 
                     '--v=1',
@@ -146,7 +146,8 @@ def initialize_browser_worker():
                 page = browser.pages[0]
             else:
                 page = browser.new_page()
-            logger.info("Browser initialized successfully with persistent context in worker thread")
+            headless_status = "headless" if headless else "visible"
+            logger.info(f"Browser initialized successfully with persistent context ({headless_status}) in worker thread")
     except Exception as e:
         logger.error(f"Error initializing browser in worker: {e}")
         cleanup_browser_resources_worker()
@@ -199,8 +200,8 @@ def shutdown_playwright_worker():
 start_playwright_worker()
 
 def login_and_goto_marketplace_worker(initial_url, marketplace_url):
-    """Worker thread version of login function"""
-    global page
+    """Worker thread version of login function - switches to visible mode when login needed"""
+    global page, browser
     try:
         if page is None:
             logger.error("Page is None, cannot proceed with login")
@@ -211,12 +212,56 @@ def login_and_goto_marketplace_worker(initial_url, marketplace_url):
         
         # If url does not contain "login", we assume we are logged in and redirect to marketplace
         if "login" not in page.url:
+            logger.info("Already logged in, proceeding to marketplace")
             page.goto(marketplace_url)
             return
             
-        # If not logged in, go to Facebook homepage and wait for manual login
-        page.goto("https://www.facebook.com")
-        wait_for_user_login(page)
+        # Login is required - check if we're running headless and need to switch to visible
+        logger.info("Login required - checking browser mode")
+        
+        # Check if browser is currently headless by trying to detect if we can interact with login
+        try:
+            # Try to go to Facebook and check if we can see login elements
+            page.goto("https://www.facebook.com")
+            time.sleep(3)
+            
+            # Look for login elements
+            login_elements = page.locator('input[name="email"], input[data-testid="royal_email"]').count()
+            
+            if login_elements > 0:
+                logger.info("Login form detected - need visible browser for manual login")
+                
+                # Check if we're running in headless mode
+                try:
+                    # Try to detect if browser window is visible
+                    is_headless = page.evaluate("() => window.outerHeight === 0 || window.outerWidth === 0")
+                    if is_headless:
+                        logger.info("Currently in headless mode, restarting browser in visible mode for login")
+                        cleanup_browser_resources_worker()
+                        initialize_browser_worker(headless=False)  # Restart in visible mode
+                        page.goto("https://www.facebook.com")
+                        time.sleep(3)
+                except Exception as detection_error:
+                    logger.warning(f"Could not detect browser mode: {detection_error}, assuming headless")
+                    # If we can't detect, restart in visible mode to be safe
+                    cleanup_browser_resources_worker()
+                    initialize_browser_worker(headless=False)
+                    page.goto("https://www.facebook.com")
+                    time.sleep(3)
+                
+                # Wait for manual login
+                wait_for_user_login(page)
+                
+                # After successful login, we can continue - browser will stay visible for this session
+                logger.info("Login completed successfully")
+            
+        except Exception as e:
+            logger.warning(f"Error checking login status: {e}")
+            # If we can't determine login status, assume login is needed in visible mode
+            cleanup_browser_resources_worker()
+            initialize_browser_worker(headless=False)
+            page.goto("https://www.facebook.com")
+            wait_for_user_login(page)
         
         # After login, navigate to marketplace
         page.goto(marketplace_url)
@@ -227,17 +272,17 @@ def login_and_goto_marketplace_worker(initial_url, marketplace_url):
         raise e
 
 def restart_browser_worker():
-    """Worker thread version of browser restart"""
+    """Worker thread version of browser restart - starts in headless mode by default"""
     global browser, page
     logger.warning("Restarting browser in worker thread...")
     
     # Clean up existing resources
     cleanup_browser_resources_worker()
     
-    # Try to initialize browser once
+    # Try to initialize browser once - start headless by default
     try:
-        initialize_browser_worker()
-        logger.info("Browser restarted successfully in worker thread")
+        initialize_browser_worker(headless=True)  # Default to headless mode
+        logger.info("Browser restarted successfully in worker thread (headless mode)")
     except Exception as e:
         logger.error(f"Failed to restart browser in worker thread: {e}")
         raise e
@@ -314,18 +359,23 @@ def crawl_facebook_marketplace(city: str, query: str, max_price: int, max_result
       common_items = set(recent_query_results_urls) & set(suggested_results_urls)
       logger.info(f"Common item links for query '{query}': {list(common_items)}")
 
-      # Add metadata to indicate item type
+      # Add metadata to indicate item type based on new requirements:
+      # - "NEW" pill: only for recent results with "just listed" pill
+      # - "HOT" pill: only for suggested results with "just listed" pill  
+      # - "SUGGESTED" pill: for suggested results without "just listed" pill
+      # - No special pill: for recent results without "just listed" pill
+      
       for item in recent_query_results:
-        if item["link"] in common_items:
-          item["item_type"] = "hot"  # Appears in both recent and suggested
+        if item.get('has_just_listed_pill', False):
+          item["item_type"] = "new"  # Recent with "just listed" pill
         else:
-          item["item_type"] = "new"  # Only in recent
+          item["item_type"] = "recent"  # Recent without "just listed" pill
 
       for item in suggested_results:
-        if item["link"] in common_items:
-          item["item_type"] = "hot"  # Appears in both recent and suggested
+        if item.get('has_just_listed_pill', False):
+          item["item_type"] = "hot"  # Suggested with "just listed" pill (hot item)
         else:
-          item["item_type"] = "suggested"  # Only in suggested
+          item["item_type"] = "suggested"  # Suggested without "just listed" pill
 
       consolidated_query_result_urls = list(common_items) + [item for item in recent_query_results_urls + suggested_results_urls if item not in list(common_items)]
       consolidated_query_results = [item for item in recent_query_results + suggested_results if item["link"] in consolidated_query_result_urls]
@@ -412,6 +462,9 @@ def crawl_query_worker(city: str, query: str, max_price: int, max_results: int, 
             # Get the item URL using multiple strategies
             post_url = find_listing_url(listing)
 
+            # Check if listing has "Just listed" pill
+            has_just_listed_pill = find_just_listed_pill(listing)
+
             # Only add the item if the title includes any of the query terms
             query_parts = query.split(' ')
             if title is not None and post_url is not None and image is not None and any(part.lower() in title.lower() for part in query_parts):
@@ -419,7 +472,8 @@ def crawl_query_worker(city: str, query: str, max_price: int, max_results: int, 
                 parsed.append({
                     'image': image,
                     'title': title,
-                    'post_url': post_url
+                    'post_url': post_url,
+                    'has_just_listed_pill': has_just_listed_pill
                 })
 
         # Return the parsed data as a JSON.
@@ -427,11 +481,23 @@ def crawl_query_worker(city: str, query: str, max_price: int, max_results: int, 
         # Grab only max results amount
         parsed = parsed[:max_results]
         for item in parsed:
+            # Determine item type based on suggested flag and "just listed" pill
+            if suggested and item['has_just_listed_pill']:
+                item_type = 'hot'  # 🔥 HOT items: Suggested results with "Just listed" pill
+            elif not suggested and item['has_just_listed_pill']:
+                item_type = 'new'  # ✨ NEW items: Recent results with "Just listed" pill
+            elif suggested and not item['has_just_listed_pill']:
+                item_type = 'suggested'  # 💡 SUGGESTED items: Suggested results without "Just listed" pill
+            else:
+                item_type = 'recent'  # No badge: Recent results without "Just listed" pill
+            
             result.append({
                 'name': item['title'],
                 'title': item['title'],
                 'image': item['image'],
-                'link': item['post_url']
+                'link': item['post_url'],
+                'has_just_listed_pill': item['has_just_listed_pill'],
+                'item_type': item_type
             })
 
         return result
@@ -578,6 +644,42 @@ def find_listing_url(listing):
                 return href
     
     return None
+
+def find_just_listed_pill(listing):
+    """Find the 'Just listed' pill on Facebook Marketplace listings."""
+    # Strategy 1: Look for text that contains "just listed" variations
+    all_text_elements = listing.find_all(text=True)
+    for text in all_text_elements:
+        text_lower = text.strip().lower()
+        if text_lower in ['just listed', 'just now', 'new listing', 'recently listed']:
+            return True
+    
+    # Strategy 2: Look for specific elements that might contain the pill
+    # Facebook often uses span or div elements for pills/badges
+    spans = listing.find_all('span')
+    for span in spans:
+        span_text = span.get_text(strip=True).lower()
+        if span_text in ['just listed', 'just now', 'new listing', 'recently listed']:
+            return True
+    
+    # Strategy 3: Look for divs with pill-like styling or content
+    divs = listing.find_all('div')
+    for div in divs:
+        div_text = div.get_text(strip=True).lower()
+        if div_text in ['just listed', 'just now', 'new listing', 'recently listed']:
+            # Check if this div looks like a pill (small, styled element)
+            if len(div_text) < 20 and not div.find_all(['img', 'a']):  # Likely a text pill
+                return True
+    
+    # Strategy 4: Look for elements with common pill/badge class patterns
+    # Facebook might use classes like 'pill', 'badge', 'tag', etc.
+    pill_elements = listing.find_all(attrs={'class': lambda x: x and any(keyword in ' '.join(x).lower() for keyword in ['pill', 'badge', 'tag', 'label'])})
+    for element in pill_elements:
+        element_text = element.get_text(strip=True).lower()
+        if any(keyword in element_text for keyword in ['just', 'listed', 'new', 'recent']):
+            return True
+    
+    return False
 
 # Configuration for fallback selectors (can be updated if needed)
 FALLBACK_SELECTORS = {
