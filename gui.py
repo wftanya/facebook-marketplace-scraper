@@ -7,9 +7,85 @@ import json
 import requests
 from datetime import datetime
 from PIL import Image
+from pathlib import Path
+from pathlib import Path
 
 # Configure page to use full width - must be first Streamlit command
 st.set_page_config(page_title="DingBot™ Facebook Scraper", layout="wide")
+
+# Notification tracking (same as backend)
+NOTIFICATION_TRACKING_FILE = "hot_items_notifications.json"
+
+def load_notified_items():
+    """Load the set of item IDs we've already sent notifications for"""
+    try:
+        if Path(NOTIFICATION_TRACKING_FILE).exists():
+            with open(NOTIFICATION_TRACKING_FILE, 'r') as f:
+                data = json.load(f)
+                # Return set of item IDs, and clean old entries (older than 7 days)
+                current_time = datetime.now().timestamp()
+                week_ago = current_time - (7 * 24 * 60 * 60)  # 7 days in seconds
+                
+                # Filter out old entries
+                fresh_items = {
+                    item_id: timestamp 
+                    for item_id, timestamp in data.items() 
+                    if timestamp > week_ago
+                }
+                
+                return set(fresh_items.keys())
+    except Exception as e:
+        print(f"Error loading notification tracking file: {e}")
+    
+    return set()
+
+def add_notified_items_gui(new_item_ids):
+    """Add new item IDs to the notification tracking with current timestamp (GUI version)"""
+    try:
+        # Load existing data as dict (item_id -> timestamp)
+        notified_dict = {}
+        if Path(NOTIFICATION_TRACKING_FILE).exists():
+            with open(NOTIFICATION_TRACKING_FILE, 'r') as f:
+                notified_dict = json.load(f)
+        
+        # Add new items with current timestamp
+        current_time = datetime.now().timestamp()
+        for item_id in new_item_ids:
+            notified_dict[item_id] = current_time
+        
+        # Save updated data
+        with open(NOTIFICATION_TRACKING_FILE, 'w') as f:
+            json.dump(notified_dict, f, indent=2)
+        
+        print(f"GUI: Added {len(new_item_ids)} items to notification tracking")
+        
+    except Exception as e:
+        print(f"GUI: Error adding items to notification tracking: {e}")
+
+def extract_item_id(url):
+    """Extract the item ID from a Facebook Marketplace URL (same as backend)"""
+    if not url:
+        return None
+    
+    # Handle relative URLs by converting to absolute first
+    if url.startswith('/'):
+        url = f"https://www.facebook.com{url}"
+    
+    # Look for patterns like /marketplace/item/{item_id} or /marketplace/item/{item_id}/?...
+    import re
+    patterns = [
+        r'/marketplace/item/(\d+)',  # Most common pattern
+        r'marketplace.*?item.*?(\d+)',  # Backup pattern
+        r'item.*?(\d+)',  # Even more generic
+    ]
+    
+    for pattern in patterns:
+        match = re.search(pattern, url)
+        if match:
+            return match.group(1)
+    
+    # If no pattern matches, use the full URL as fallback (shouldn't happen but safe)
+    return url
 
 def countdown_timer():
   countdown_message.empty()
@@ -71,38 +147,40 @@ def crawl():  # Get current values from Streamlit widgets instead of global vari
   # Flatten all results for alert checking
   all_results = []
   for query_results in results_by_query.values():
-    all_results.extend(query_results)
-  # Display the length of the results list and check for new items
+    all_results.extend(query_results)  # Display the length of the results list and check for new items
   if len(all_results) > 0:
     # Track items by their link (more reliable than title for duplicates)
     latest_items = {item["link"]: item for item in all_results}
     
-    # Initialize previous hot items if not exists
-    if 'previous_hot_items' not in st.session_state:
-      st.session_state.previous_hot_items = set()
+    # Load already notified items from persistent storage
+    already_notified = load_notified_items()
     
-    # Find new hot items specifically
-    current_hot_items = {link for link, item in latest_items.items() if item.get('item_type') == 'hot'}
-    new_hot_items = current_hot_items - st.session_state.previous_hot_items
+    # Find new hot items that haven't been notified about yet
+    hot_items = {link: item for link, item in latest_items.items() if item.get('item_type') == 'hot'}
+    new_hot_item_ids = []
+    new_hot_items_data = []
     
-    # Only trigger ding for new hot items
-    if len(new_hot_items) > 0:
+    for link, item in hot_items.items():
+        item_id = extract_item_id(link)
+        if item_id and item_id not in already_notified:
+            new_hot_item_ids.append(item_id)
+            new_hot_items_data.append(item)
+    
+    # Only trigger ding for truly new hot items
+    if len(new_hot_item_ids) > 0:
       # Get the titles of new hot items for the alert
-      new_hot_titles = [latest_items[link]["title"] for link in new_hot_items]
+      new_hot_titles = [item["title"] for item in new_hot_items_data]
       latest_string = "\\n\\n".join(new_hot_titles)
       
-      # Update the session state
-      st.session_state.previous_hot_items = current_hot_items
+      # Add to notification tracking
+      add_notified_items_gui(new_hot_item_ids)
       
-      # TODO: still getting repeat alerts. perhaps when random login prompt?
       alert_js=f"alert('New HOT items!!\\n\\n{latest_string}')"
       alert_html = f"<script>{alert_js}</script>"
 
       # stcomponents.html(alert_html) # TODO: temporarily disabled need a better alert
       ding()
-    else:
-      # Still update hot items tracking even if no new ones found
-      st.session_state.previous_hot_items = current_hot_items
+      print(f"🔥 DING! Found {len(new_hot_item_ids)} new HOT items!")
   last_ran_formatted = datetime.now().time().strftime("%I:%M:%S %p")
   results_message.markdown(f"*Showing latest {current_max_listings} listings (per query) since last scrape at **{last_ran_formatted}***")
   # Clear previous results

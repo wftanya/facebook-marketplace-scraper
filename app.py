@@ -30,6 +30,19 @@ import threading
 import queue
 from concurrent.futures import ThreadPoolExecutor
 import uuid
+import smtplib
+import ssl
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from email.mime.image import MIMEImage
+import requests
+from datetime import datetime
+from pathlib import Path
+import os
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -342,6 +355,7 @@ def crawl_facebook_marketplace(city: str, query: str, max_price: int, max_result
     results = []
     # Split the query into a list
     query_list = query.split(',')
+    notified_items = load_notified_items()
     for query in query_list:
       try:
         # Use the new robust crawling method
@@ -352,35 +366,76 @@ def crawl_facebook_marketplace(city: str, query: str, max_price: int, max_result
         recent_query_results = []
         suggested_results = []
 
-      recent_query_results_urls = [item["link"] for item in recent_query_results]
-      suggested_results_urls = [item["link"] for item in suggested_results]
+      # Extract item IDs for comparison instead of full URLs
+      recent_query_item_ids = {extract_item_id(item["link"]): item for item in recent_query_results if extract_item_id(item["link"])}
+      suggested_results_item_ids = {extract_item_id(item["link"]): item for item in suggested_results if extract_item_id(item["link"])}
 
-      # If the items appear in both recent and suggested, mark them as "hot"
-      common_items = set(recent_query_results_urls) & set(suggested_results_urls)
-      logger.info(f"Common item links for query '{query}': {list(common_items)}")
+      # Find common items based on item IDs (not full URLs)
+      # TODO: this may not be grabbing from the latest input query?
+      common_item_ids = set(recent_query_item_ids.keys()) & set(suggested_results_item_ids.keys())
+      logger.info(f"Common item IDs for query '{query}': {list(common_item_ids)} (found {len(common_item_ids)} matches)")
 
       # Add metadata to indicate item type based on new requirements:
-      # - "NEW" pill: only for recent results with "just listed" pill
-      # - "HOT" pill: only for suggested results with "just listed" pill  
-      # - "SUGGESTED" pill: for suggested results without "just listed" pill
-      # - No special pill: for recent results without "just listed" pill
+      # Priority order: 
+      # 1. HOT: Items in both recent AND suggested (common items)
+      # 2. NEW: Recent-only items with "just listed" pill
+      # 3. SUGGESTED: Suggested-only items without "just listed" pill
+      # 4. No badge: Recent-only items without "just listed" pill
       
+      # First, assign basic types
       for item in recent_query_results:
-        if item.get('has_just_listed_pill', False):
-          item["item_type"] = "new"  # Recent with "just listed" pill
+        item_id = extract_item_id(item["link"])
+        if item_id in common_item_ids:
+          item["item_type"] = "hot"  # Items in both recent AND suggested = HOT
+        elif item.get('has_just_listed_pill', False):
+          item["item_type"] = "new"  # Recent-only with "just listed" pill
         else:
-          item["item_type"] = "recent"  # Recent without "just listed" pill
+          item["item_type"] = "recent"  # Recent-only without "just listed" pill
 
       for item in suggested_results:
-        if item.get('has_just_listed_pill', False):
-          item["item_type"] = "hot"  # Suggested with "just listed" pill (hot item)
+        item_id = extract_item_id(item["link"])
+        if item_id in common_item_ids:
+          item["item_type"] = "hot"  # Items in both recent AND suggested = HOT
+        elif item.get('has_just_listed_pill', False):
+          item["item_type"] = "hot"  # Suggested with "just listed" pill also = HOT
         else:
-          item["item_type"] = "suggested"  # Suggested without "just listed" pill
+          item["item_type"] = "suggested"  # Suggested-only without "just listed" pill
 
-      consolidated_query_result_urls = list(common_items) + [item for item in recent_query_results_urls + suggested_results_urls if item not in list(common_items)]
-      consolidated_query_results = [item for item in recent_query_results + suggested_results if item["link"] in consolidated_query_result_urls]
+      # Create consolidated results using item IDs to avoid duplicates
+      all_items_by_id = {}
+      
+      # Add recent items first
+      for item in recent_query_results:
+        item_id = extract_item_id(item["link"])
+        if item_id:
+            all_items_by_id[item_id] = item
+      
+      # Add suggested items, but prefer hot items if they exist in both
+      for item in suggested_results:
+        item_id = extract_item_id(item["link"])
+        if item_id:
+            # If item exists in both recent and suggested, keep the one with higher priority
+            if item_id in all_items_by_id:
+                # If suggested item is hot, or if existing item isn't hot/new, replace it
+                existing_type = all_items_by_id[item_id].get("item_type", "")
+                suggested_type = item.get("item_type", "")
+                
+                if suggested_type == "hot" or (existing_type not in ["hot", "new"] and suggested_type in ["hot", "suggested"]):
+                    all_items_by_id[item_id] = item
+            else:
+                all_items_by_id[item_id] = item
 
+      # Convert back to list
+      consolidated_query_results = list(all_items_by_id.values())
+      
       results.extend(consolidated_query_results)
+
+      # Send email notification for HOT items
+      hot_items = [item for item in suggested_results if item.get('item_type') == 'hot']
+      new_hot_item_ids = [extract_item_id(item["link"]) for item in hot_items if extract_item_id(item["link"]) not in notified_items]
+      if new_hot_item_ids:
+          send_hot_item_email(hot_items, query, city)
+          add_notified_items(new_hot_item_ids)
 
     return results
 
@@ -440,6 +495,7 @@ def crawl_query_worker(city: str, query: str, max_price: int, max_results: int, 
         if suggested:
             marketplace_url = f'https://www.facebook.com/marketplace/{city}/search?query={query}&maxPrice={max_price}&daysSinceListed=3'
 
+        logger.info(f"Crawling URL: {marketplace_url} (suggested={suggested})")
         login_and_goto_marketplace_worker(initial_url, marketplace_url)
         
         # Get listings of particular item in a particular city for a particular price.
@@ -681,6 +737,31 @@ def find_just_listed_pill(listing):
     
     return False
 
+def extract_item_id(url):
+    """Extract the item ID from a Facebook Marketplace URL"""
+    if not url:
+        return None
+    
+    # Handle relative URLs by converting to absolute first
+    if url.startswith('/'):
+        url = f"https://www.facebook.com{url}"
+    
+    # Look for patterns like /marketplace/item/{item_id} or /marketplace/item/{item_id}/?...
+    import re
+    patterns = [
+        r'/marketplace/item/(\d+)',  # Most common pattern
+        r'marketplace.*?item.*?(\d+)',  # Backup pattern
+        r'item.*?(\d+)',  # Even more generic
+    ]
+    
+    for pattern in patterns:
+        match = re.search(pattern, url)
+        if match:
+            return match.group(1)
+    
+    # If no pattern matches, use the full URL as fallback (shouldn't happen but safe)
+    return url
+
 # Configuration for fallback selectors (can be updated if needed)
 FALLBACK_SELECTORS = {
     'listings': [
@@ -705,4 +786,174 @@ FALLBACK_SELECTORS = {
         'h1, h2, h3, h4, h5, h6',
     ]
 }
+
+# Email configuration - use environment variables for security
+EMAIL_SENDER = os.getenv('GMAIL_SENDER', '')  # Your Gmail address
+EMAIL_PASSWORD = os.getenv('GMAIL_APP_PASSWORD', '')  # Your Gmail App Password
+EMAIL_RECIPIENTS = os.getenv('EMAIL_RECIPIENTS', '').split(',')  # Comma-separated recipient emails
+
+def send_hot_item_email(hot_items, query, city):
+    """Send email notification for HOT items found"""
+    logger.info(f"Preparing to send email for {len(hot_items)} HOT items found in {city} for query '{query}'")
+    if not EMAIL_SENDER or not EMAIL_PASSWORD or not EMAIL_RECIPIENTS[0]:
+        logger.warning("Email configuration not set. Skipping email notification.")
+        return False
+    
+    try:
+        # Create message
+        msg = MIMEMultipart('alternative')
+        msg['Subject'] = f"🔥 {len(hot_items)} HOT Marketplace Item{'s' if len(hot_items) > 1 else ''} Found!"
+        msg['From'] = EMAIL_SENDER
+        msg['To'] = ', '.join(EMAIL_RECIPIENTS)
+        
+        # Create HTML content
+        html_content = f"""
+        <html>
+        <body style="font-family: Arial, sans-serif; max-width: 800px; margin: 0 auto;">
+            <div style="background: linear-gradient(135deg, #ff4444, #ff6666); color: white; padding: 20px; text-align: center; border-radius: 8px; margin-bottom: 20px;">
+                <h1 style="margin: 0; font-size: 28px;">🔥 HOT ITEMS ALERT! 🔥</h1>
+                <p style="margin: 10px 0 0 0; font-size: 16px;">Found {len(hot_items)} hot item{'s' if len(hot_items) > 1 else ''} in {city} for "{query}"</p>
+                <p style="margin: 5px 0 0 0; font-size: 14px; opacity: 0.9;">{datetime.now().strftime('%B %d, %Y at %I:%M %p')}</p>
+            </div>
+        """
+        
+        for item in hot_items:
+            # Fix URL formatting
+            listing_url = item['link']
+            if listing_url.startswith('/'):
+                listing_url = f"https://www.facebook.com{listing_url}"
+            elif not listing_url.startswith('http'):
+                listing_url = f"https://www.facebook.com/{listing_url}"
+            
+            html_content += f"""
+            <div style="border: 3px solid #ff4444; border-radius: 12px; padding: 20px; margin: 15px 0; background: #fff9f9;">
+                <div style="display: inline-block; background: #ff4444; color: white; padding: 4px 12px; border-radius: 20px; font-size: 12px; font-weight: bold; margin-bottom: 10px;">🔥 HOT ITEM</div>
+                <h2 style="color: #333; margin: 10px 0;">🔥 {item['title']}</h2>
+                <div style="text-align: center; margin: 15px 0;">
+                    <a href="{listing_url}" target="_blank" style="text-decoration: none;">
+                        <img src="{item['image']}" style="max-width: 100%; max-height: 300px; border-radius: 8px; cursor: pointer; border: 2px solid #ff4444;" alt="{item['title']}">
+                    </a>
+                </div>
+                <div style="text-align: center; margin-top: 15px;">
+                    <a href="{listing_url}" target="_blank" style="background: #ff4444; color: white; padding: 12px 24px; text-decoration: none; border-radius: 25px; font-weight: bold; display: inline-block;">VIEW ON FACEBOOK →</a>
+                </div>
+            </div>
+            """
+        
+        html_content += """
+        <div style="text-align: center; padding: 20px; background: #f8f8f8; border-radius: 8px; margin-top: 20px; color: #666;">
+            <p style="margin: 0; font-size: 14px;">This alert was sent by DingBot™ Facebook Scraper</p>
+            <p style="margin: 5px 0 0 0; font-size: 12px;">Hot items are suggested results with Facebook's "Just listed" indicator</p>
+        </div>
+        </body>
+        </html>
+        """
+        
+        # Create plain text version
+        text_content = f"""
+HOT ITEMS ALERT!
+
+Found {len(hot_items)} hot item{'s' if len(hot_items) > 1 else ''} in {city} for "{query}"
+{datetime.now().strftime('%B %d, %Y at %I:%M %p')}
+
+"""
+        
+        for item in hot_items:
+            listing_url = item['link']
+            if listing_url.startswith('/'):
+                listing_url = f"https://www.facebook.com{listing_url}"
+            elif not listing_url.startswith('http'):
+                listing_url = f"https://www.facebook.com/{listing_url}"
+            
+            text_content += f"""
+🔥 HOT ITEM: {item['title']}
+Link: {listing_url}
+Image: {item['image']}
+
+"""
+        
+        text_content += """
+---
+This alert was sent by DingBot™ Facebook Scraper
+Hot items are suggested results with Facebook's "Just listed" indicator
+"""
+        
+        # Attach text and HTML versions
+        text_part = MIMEText(text_content, 'plain')
+        html_part = MIMEText(html_content, 'html')
+        msg.attach(text_part)
+        msg.attach(html_part)
+        
+        # Send email
+        context = ssl.create_default_context()
+        with smtplib.SMTP('smtp.gmail.com', 587) as server:
+            server.starttls(context=context)
+            server.login(EMAIL_SENDER, EMAIL_PASSWORD)
+            server.send_message(msg)
+        
+        logger.info(f"Successfully sent email notification for {len(hot_items)} hot items")
+        return True
+        
+    except Exception as e:
+        logger.error(f"Failed to send email notification: {e}")
+        return False
+
+# Notification tracking system
+NOTIFICATION_TRACKING_FILE = "hot_items_notifications.json"
+
+def load_notified_items():
+    """Load the set of item IDs we've already sent notifications for"""
+    try:
+        if Path(NOTIFICATION_TRACKING_FILE).exists():
+            with open(NOTIFICATION_TRACKING_FILE, 'r') as f:
+                data = json.load(f)
+                # Return set of item IDs, and clean old entries (older than 7 days)
+                current_time = datetime.now().timestamp()
+                week_ago = current_time - (7 * 24 * 60 * 60)  # 7 days in seconds
+                
+                # Filter out old entries
+                fresh_items = {
+                    item_id: timestamp 
+                    for item_id, timestamp in data.items() 
+                    if timestamp > week_ago
+                }
+                
+                # Save cleaned data back
+                if len(fresh_items) != len(data):
+                    save_notified_items(fresh_items)
+                
+                return set(fresh_items.keys())
+    except Exception as e:
+        logger.warning(f"Error loading notification tracking file: {e}")
+    
+    return set()
+
+def save_notified_items(notified_items_dict):
+    """Save the dictionary of notified item IDs with timestamps"""
+    try:
+        with open(NOTIFICATION_TRACKING_FILE, 'w') as f:
+            json.dump(notified_items_dict, f, indent=2)
+    except Exception as e:
+        logger.error(f"Error saving notification tracking file: {e}")
+
+def add_notified_items(new_item_ids):
+    """Add new item IDs to the notification tracking with current timestamp"""
+    try:
+        # Load existing data as dict (item_id -> timestamp)
+        notified_dict = {}
+        if Path(NOTIFICATION_TRACKING_FILE).exists():
+            with open(NOTIFICATION_TRACKING_FILE, 'r') as f:
+                notified_dict = json.load(f)
+        
+        # Add new items with current timestamp
+        current_time = datetime.now().timestamp()
+        for item_id in new_item_ids:
+            notified_dict[item_id] = current_time
+        
+        # Save updated data
+        save_notified_items(notified_dict)
+        logger.info(f"Added {len(new_item_ids)} items to notification tracking")
+        
+    except Exception as e:
+        logger.error(f"Error adding items to notification tracking: {e}")
 

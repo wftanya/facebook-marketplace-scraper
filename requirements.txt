@@ -35,6 +35,7 @@ pydeck==0.8.1b0
 pyee==11.0.1
 pygments==2.17.2
 python-dateutil==2.8.2
+python-dotenv==1.0.0
 pytz==2023.3.post1
 referencing==0.32.1
 requests==2.31.0
