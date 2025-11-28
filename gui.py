@@ -5,7 +5,7 @@ import streamlit.components.v1 as stcomponents
 import time
 import json 
 import requests
-from datetime import datetime
+from datetime import time as datetime_time, datetime
 from PIL import Image
 from pathlib import Path
 from pathlib import Path
@@ -103,6 +103,12 @@ def ding():
   unique_id = f'dingSound_{time.time()}_{random.randint(1, 1000)}'
   audio_html = f'<audio id="{unique_id}" autoplay><source src="app/static/ding.mp3"></audio>'
   stcomponents.html(audio_html)
+
+def maybe_crawl():
+  if datetime.now().time() > datetime_time(6, 0):
+    crawl()
+  else:
+    print("Paused until 6AM") # TODO: To constant
 
 def crawl():  # Get current values from Streamlit widgets instead of global variables
   current_city = st.session_state.get('city', city)
@@ -297,10 +303,10 @@ supported_cities = ["Hamilton", "Barrie", "Toronto"] # TODO: more oNTARIO cities
 city = st.selectbox("City", supported_cities, 0, key='city')
 query = st.text_input("Query (comma,between,multiple,queries)", "Horror VHS,Digimon", key='query')
 # TODO: don't scrape until there is an input. Ensure that subsequent auto scrapes use the input
-max_price = st.text_input("Max Price ($)", "1000", key='max_price')
+max_price = st.text_input("Max Price ($)", "9999", key='max_price')
 # This value should be calibrated to your queries. Facebook sometimes is very lax about what they think
 # is related to your search query.
-max_listings = st.text_input("Max Latest Listings", "8", key='max_listings')
+max_listings = st.text_input("Max Latest Listings", "20", key='max_listings')
 
 countdown_message = st.empty()
 
@@ -315,10 +321,12 @@ if submit:
   countdown_message.text("Scraping...")
   crawl()
 
-# Schedule the scraper to run every 3 minutes
-schedule.every(3).minutes.do(crawl)
+# Schedule the scraper to run every 3 minutes, pausing overnight
+schedule.every(3).minutes.do(maybe_crawl)
+
 # Timer message
 countdown_timer() # TODO: FIRST auto scrape not working?
+# TODO: countdown timer message to reflect paused overnight
 
 # Run the scheduler
 while True:

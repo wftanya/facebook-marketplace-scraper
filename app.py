@@ -41,6 +41,10 @@ from pathlib import Path
 import os
 from dotenv import load_dotenv
 
+LOG_PATH = "marketplace_log.jsonl"
+DATE_MARKER_PATH = "marketplace_log_date.txt"
+HOT_KEYWORDS = ["free"]
+
 # Load environment variables
 load_dotenv()
 
@@ -385,18 +389,26 @@ def crawl_facebook_marketplace(city: str, query: str, max_price: int, max_result
       # First, assign basic types
       for item in recent_query_results:
         item_id = extract_item_id(item["link"])
+        if query.lower() in item["title"].lower(): # Trying to catch recent relevant listings that haven't appeared in suggested yet
+            print("Flagged recent item as hot based on query match:", item["title"])
+            item["item_type"] == "hot"
+        elif any(word in item["title"].lower() for word in HOT_KEYWORDS): # Trying to catch recent relevant listings that haven't appeared in suggested yet
+            item["item_type"] == "hot"
         if item_id in common_item_ids:
           item["item_type"] = "hot"  # Items in both recent AND suggested = HOT
-        elif item.get('has_just_listed_pill', False):
+        elif item.get('has_just_listed_pill', True):
           item["item_type"] = "new"  # Recent-only with "just listed" pill
         else:
           item["item_type"] = "recent"  # Recent-only without "just listed" pill
 
       for item in suggested_results:
         item_id = extract_item_id(item["link"])
-        if item_id in common_item_ids:
-          item["item_type"] = "hot"  # Items in both recent AND suggested = HOT
-        elif item.get('has_just_listed_pill', False):
+        # TODO: common items as hot items logic isn't quite right since it is notifying us of old listings. Some listings are in recent but later appear in suggested and vice versa for some reason on FB's end.
+        # TODO: above may be due to FB marketplace's recent query not being accurate anymore.. Nov 27 2025
+        # TODO: above may also be due to suggested listings only being suggested after some time has passed since the listing was made
+        # if item_id in common_item_ids: # TODO: NOW if old listings are still slipping thru the cracks, add additional check to ensure that the query term is even in the title.. sicne this issue seems to only happen to irrelevant noise listings. NVM its happening to good listings too 
+        #   item["item_type"] = "hot"  # Items in both recent AND suggested = HOT
+        if item.get('has_just_listed_pill', True):
           item["item_type"] = "hot"  # Suggested with "just listed" pill also = HOT
         else:
           item["item_type"] = "suggested"  # Suggested-only without "just listed" pill
@@ -430,11 +442,12 @@ def crawl_facebook_marketplace(city: str, query: str, max_price: int, max_result
       
       results.extend(consolidated_query_results)
 
-      # Send email notification for HOT items
-      hot_items = [item for item in suggested_results if item.get('item_type') == 'hot']
-      new_hot_item_ids = [extract_item_id(item["link"]) for item in hot_items if extract_item_id(item["link"]) not in notified_items]
-      if new_hot_item_ids:
-          send_hot_item_email(hot_items, query, city)
+      # Send email notification for HOT items we haven't already been notified for
+      hot_items = [item for item in consolidated_query_results if item.get('item_type') == 'hot']
+      new_hot_items = [item for item in hot_items if extract_item_id(item["link"]) not in notified_items]
+      if new_hot_items:
+          send_hot_item_email(new_hot_items, query, city)
+          new_hot_item_ids = [extract_item_id(item["link"]) for item in new_hot_items]
           add_notified_items(new_hot_item_ids)
 
     return results
@@ -527,6 +540,7 @@ def crawl_query_worker(city: str, query: str, max_price: int, max_results: int, 
                 # Append the parsed data to the list.
                 parsed.append({
                     'image': image,
+                    'id': extract_item_id(post_url),
                     'title': title,
                     'post_url': post_url,
                     'has_just_listed_pill': has_just_listed_pill
@@ -534,10 +548,31 @@ def crawl_query_worker(city: str, query: str, max_price: int, max_results: int, 
 
         # Return the parsed data as a JSON.
         result = []
-        # Grab only max results amount
-        parsed = parsed[:max_results]
+        # Grab only max results amount, putting results with just listed pill in front
+        parsed_sorted = sorted(parsed, key=lambda x: not x['has_just_listed_pill'])
+        parsed = parsed_sorted[:max_results]
+
+        # ---- LOGGING LOOP ----
+        timestamp = datetime.now().isoformat()
+
+        # Convert final_results into a set of IDs so we know which were excluded
+        included_ids = {item["id"] for item in parsed}
+
+        for item in parsed_sorted:
+            log_listing({
+                "timestamp": timestamp,
+                "title": item["title"],
+                "id": item["id"],
+                "post_url": item["post_url"],
+                "is_suggested": suggested,
+                "has_just_listed_pill": item["has_just_listed_pill"],
+                "included_in_results": item["id"] in included_ids,
+            })
+
+
         for item in parsed:
             # Determine item type based on suggested flag and "just listed" pill
+            # TODO: I don't think just listed pill is a thing anymore, at least in list view
             if suggested and item['has_just_listed_pill']:
                 item_type = 'hot'  # 🔥 HOT items: Suggested results with "Just listed" pill
             elif not suggested and item['has_just_listed_pill']:
@@ -546,7 +581,7 @@ def crawl_query_worker(city: str, query: str, max_price: int, max_results: int, 
                 item_type = 'suggested'  # 💡 SUGGESTED items: Suggested results without "Just listed" pill
             else:
                 item_type = 'recent'  # No badge: Recent results without "Just listed" pill
-            
+
             result.append({
                 'name': item['title'],
                 'title': item['title'],
@@ -558,7 +593,9 @@ def crawl_query_worker(city: str, query: str, max_price: int, max_results: int, 
 
         return result
     except Exception as e:
-        logger.error(f"Error during crawl in worker: {e}")
+        logger.error("Error during crawl in worker", exc_info=True)
+        # Log the traceback for more details
+        
         # Try to restart browser in worker thread
         try:
             restart_browser_worker()
@@ -957,3 +994,32 @@ def add_notified_items(new_item_ids):
     except Exception as e:
         logger.error(f"Error adding items to notification tracking: {e}")
 
+
+def log_listing(listing_dict):
+    """Append a single listing event to the JSONL log."""
+    clear_logs_if_new_day()
+
+    with open(LOG_PATH, "a") as f:
+        f.write(json.dumps(listing_dict) + "\n")
+
+
+def clear_logs_if_new_day():
+    """Deletes log file once per calendar day."""
+    today = datetime.now().strftime("%Y-%m-%d")
+
+    # If no date marker exists, create one and allow logging
+    if not os.path.exists(DATE_MARKER_PATH):
+        with open(DATE_MARKER_PATH, "w") as f:
+            f.write(today)
+        return
+
+    # Read the last date the file was written
+    with open(DATE_MARKER_PATH, "r") as f:
+        last_date = f.read().strip()
+
+    # If new day → wipe logs & update marker
+    if last_date != today:
+        if os.path.exists(LOG_PATH):
+            os.remove(LOG_PATH)  # delete the log file
+        with open(DATE_MARKER_PATH, "w") as f:
+            f.write(today)
