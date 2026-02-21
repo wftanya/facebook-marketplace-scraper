@@ -89,7 +89,7 @@ def extract_item_id(url):
 
 def countdown_timer():
   countdown_message.empty()
-  duration = 3 * 60  # 3 minutes instead of 5
+  duration = 5 * 60  # Every 5 minutes
   while duration:
         mins, secs = divmod(duration, 60)
         timeformat = '{:02d}:{:02d}'.format(mins, secs)
@@ -112,6 +112,7 @@ def maybe_crawl():
 
 def crawl():  # Get current values from Streamlit widgets instead of global variables
   current_city = st.session_state.get('city', city)
+  current_radius = st.session_state.get('radius', radius)
   current_query = st.session_state.get('query', query)
   current_max_price = st.session_state.get('max_price', max_price)
   current_max_listings = st.session_state.get('max_listings', max_listings)
@@ -144,7 +145,7 @@ def crawl():  # Get current values from Streamlit widgets instead of global vari
   # Get results for each query individually
   for individual_query in query_list:
     try:
-      res = requests.get(f"http://127.0.0.1:8000/crawl_facebook_marketplace?city={current_city}&sortBy=creation_time_descend&query={individual_query}&max_price={str(int(current_max_price) * 100)}&max_results_per_query={current_max_listings}")
+      res = requests.get(f"http://127.0.0.1:8000/crawl_facebook_marketplace?city={current_city}&radius={current_radius}&sortBy=creation_time_descend&query={individual_query}&max_price={str(int(current_max_price) * 100)}&max_results_per_query={current_max_listings}")
       query_results = res.json()
       results_by_query[individual_query] = query_results
     except:
@@ -153,7 +154,11 @@ def crawl():  # Get current values from Streamlit widgets instead of global vari
   # Flatten all results for alert checking
   all_results = []
   for query_results in results_by_query.values():
-    all_results.extend(query_results)  # Display the length of the results list and check for new items
+    if isinstance(query_results, list):
+        all_results.extend(query_results)
+    else:
+      print(f"Expected list, got {type(query_results)}: {query_results}")
+      
   if len(all_results) > 0:
     # Track items by their link (more reliable than title for duplicates)
     latest_items = {item["link"]: item for item in all_results}
@@ -293,15 +298,16 @@ if 'current_latest' not in st.session_state:
     st.session_state.current_latest = []
 
 # Create a title for the web app.
-st.title("DingBot™ Facebook Scraper")
+st.title("DingBot™ Facebook Marketplace Scraper")
 st.subheader("Brought to you by Passivebot + WordForest")
 
 # Add a list of supported cities.
-supported_cities = ["Hamilton", "Barrie", "Toronto"] # TODO: more oNTARIO cities
+supported_cities = ["Hamilton", "104045032964460", "Barrie", "Toronto"] # TODO: more oNTARIO cities, dictionary lookup codes for cities like 104045032964460 is Kitchener
 
 # Take user input for the city, query, and max price.
 city = st.selectbox("City", supported_cities, 0, key='city')
-query = st.text_input("Query (comma,between,multiple,queries)", "Horror VHS,Digimon", key='query')
+radius = st.selectbox("Radius (km)", [1, 2, 5, 10, 20, 40, 60, 80, 100, 250, 500], 9, key='radius')
+query = st.text_input("Query (comma,between,multiple,queries)", "VHS", key='query')
 # TODO: don't scrape until there is an input. Ensure that subsequent auto scrapes use the input
 max_price = st.text_input("Max Price ($)", "9999", key='max_price')
 # This value should be calibrated to your queries. Facebook sometimes is very lax about what they think
@@ -321,8 +327,9 @@ if submit:
   countdown_message.text("Scraping...")
   crawl()
 
-# Schedule the scraper to run every 3 minutes, pausing overnight
-schedule.every(3).minutes.do(maybe_crawl)
+# Schedule the scraper to run every 5-7 minutes, pausing overnight
+variable_interval = random.randint(5, 8) # Add some randomness to avoid being too "bot-like"
+schedule.every(variable_interval).minutes.do(maybe_crawl)
 
 # Timer message
 countdown_timer() # TODO: FIRST auto scrape not working?

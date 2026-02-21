@@ -45,6 +45,8 @@ LOG_PATH = "marketplace_log.jsonl"
 DATE_MARKER_PATH = "marketplace_log_date.txt"
 HOT_KEYWORDS = ["free"]
 
+IMAGE_ROOT = Path("data/images")
+
 # Load environment variables
 load_dotenv()
 
@@ -103,11 +105,12 @@ def playwright_worker():
                 if action == 'crawl':
                     # Initialize browser if needed - start in headless mode by default
                     if browser is None or page is None:
-                        initialize_browser_worker(headless=True)
+                        initialize_browser_worker(headless=False)
                     
                     # Perform the crawl
                     result = crawl_query_worker(
                         job['city'], 
+                        job['radius'],
                         job['query'], 
                         job['max_price'], 
                         job['max_results'], 
@@ -298,7 +301,7 @@ def restart_browser_worker():
     
     # Try to initialize browser once - start headless by default
     try:
-        initialize_browser_worker(headless=True)  # Default to headless mode
+        initialize_browser_worker(headless=False)
         logger.info("Browser restarted successfully in worker thread (headless mode)")
     except Exception as e:
         logger.error(f"Failed to restart browser in worker thread: {e}")
@@ -335,13 +338,15 @@ def root():
 # Define a function to be executed when the endpoint is called.
 # Add a description to the function.
 # TODO: days since listed input
-def crawl_facebook_marketplace(city: str, query: str, max_price: int, max_results_per_query: int):
+def crawl_facebook_marketplace(city: str, radius: int, query: str, max_price: int, max_results_per_query: int):
     # Define dictionary of cities from the facebook marketplace directory for United States.
     # https://m.facebook.com/marketplace/directory/US/?_se_imp=0oey5sMRMSl7wluQZ
+    print(city)
     cities = {
         'Hamilton': 'hamilton',  # TODO: more Ontario cities
         'Barrie': 'barrie',
-        'Toronto': 'toronto'
+        'Toronto': 'toronto',
+        '104045032964460': '104045032964460' # TODO: Kitchener
     }
     # If the city is in the cities dictionary...
     if city in cities:
@@ -363,8 +368,8 @@ def crawl_facebook_marketplace(city: str, query: str, max_price: int, max_result
     for query in query_list:
       try:
         # Use the new robust crawling method
-        recent_query_results = crawl_query(city, query, max_price, max_results_per_query, False)
-        suggested_results = crawl_query(city, query, max_price, max_results_per_query, True)
+        recent_query_results = crawl_query(city, radius, query, max_price, max_results_per_query, False)
+        suggested_results = crawl_query(city, radius, query, max_price, max_results_per_query, True)
       except Exception as e:
         logger.error(f"Error crawling query '{query}': {e}")
         recent_query_results = []
@@ -394,6 +399,8 @@ def crawl_facebook_marketplace(city: str, query: str, max_price: int, max_result
             item["item_type"] == "hot"
         elif any(word in item["title"].lower() for word in HOT_KEYWORDS): # Trying to catch recent relevant listings that haven't appeared in suggested yet
             item["item_type"] == "hot"
+        # TODO: common items as hot items logic isn't quite right since it is notifying us of old listings. Some listings are in recent but later appear in suggested and vice versa for some reason on FB's end.
+        # TODO: above may be due to FB marketplace's recent query not being accurate anymore.. Nov 27 2025
         if item_id in common_item_ids:
           item["item_type"] = "hot"  # Items in both recent AND suggested = HOT
         elif item.get('has_just_listed_pill', True):
@@ -403,11 +410,9 @@ def crawl_facebook_marketplace(city: str, query: str, max_price: int, max_result
 
       for item in suggested_results:
         item_id = extract_item_id(item["link"])
-        # TODO: common items as hot items logic isn't quite right since it is notifying us of old listings. Some listings are in recent but later appear in suggested and vice versa for some reason on FB's end.
-        # TODO: above may be due to FB marketplace's recent query not being accurate anymore.. Nov 27 2025
-        # TODO: above may also be due to suggested listings only being suggested after some time has passed since the listing was made
-        # if item_id in common_item_ids: # TODO: NOW if old listings are still slipping thru the cracks, add additional check to ensure that the query term is even in the title.. sicne this issue seems to only happen to irrelevant noise listings. NVM its happening to good listings too 
-        #   item["item_type"] = "hot"  # Items in both recent AND suggested = HOT
+        # TODO: Old listings slipping thru the cracks with this, suggested listings only being suggested after some time has passed since the listing was made
+        if item_id in common_item_ids:
+          item["item_type"] = "hot"  # Items in both recent AND suggested = HOT
         if item.get('has_just_listed_pill', True):
           item["item_type"] = "hot"  # Suggested with "just listed" pill also = HOT
         else:
@@ -423,6 +428,7 @@ def crawl_facebook_marketplace(city: str, query: str, max_price: int, max_result
             all_items_by_id[item_id] = item
       
       # Add suggested items, but prefer hot items if they exist in both
+      # TODO: do we need to be doing all this?
       for item in suggested_results:
         item_id = extract_item_id(item["link"])
         if item_id:
@@ -462,7 +468,7 @@ if __name__ == "__main__":
         port=8000
     )
 
-def crawl_query(city: str, query: str, max_price: int, max_results: int, suggested: bool):
+def crawl_query(city: str, radius: int, query: str, max_price: int, max_results: int, suggested: bool):
     """Submit crawl job to worker thread and wait for result"""
     job_id = str(uuid.uuid4())
     result_queue = queue.Queue()
@@ -474,6 +480,7 @@ def crawl_query(city: str, query: str, max_price: int, max_results: int, suggest
             'job_id': job_id,
             'action': 'crawl',
             'city': city,
+            'radius': radius,
             'query': query,
             'max_price': max_price,
             'max_results': max_results,
@@ -499,14 +506,15 @@ def crawl_query(city: str, query: str, max_price: int, max_results: int, suggest
         if job_id in result_queues:
             del result_queues[job_id]
 
-def crawl_query_worker(city: str, query: str, max_price: int, max_results: int, suggested: bool):
+# TODO: NOW by city
+def crawl_query_worker(city: str, radius: int, query: str, max_price: int, max_results: int, suggested: bool):
     """Actual crawl implementation running in worker thread"""
     global page
     try:
-        marketplace_url = f'https://www.facebook.com/marketplace/{city}/search?query={query}&maxPrice={max_price}&daysSinceListed=1&sortBy=creation_time_descend'
-        initial_url = "https://www.facebook.com/login/device-based/regular/login/"
+        marketplace_url = f'https://www.facebook.com/marketplace/{city}/search?query={query}&radius={radius}&exact=false&maxPrice={max_price}&daysSinceListed=1&sortBy=creation_time_descend'
+        initial_url = "https://www.facebook.com/login"
         if suggested:
-            marketplace_url = f'https://www.facebook.com/marketplace/{city}/search?query={query}&maxPrice={max_price}&daysSinceListed=3'
+            marketplace_url = f'https://www.facebook.com/marketplace/{city}/search?query={query}&radius={radius}&exact=false&maxPrice={max_price}&daysSinceListed=3&sortBy=suggested'
 
         logger.info(f"Crawling URL: {marketplace_url} (suggested={suggested})")
         login_and_goto_marketplace_worker(initial_url, marketplace_url)
@@ -530,6 +538,14 @@ def crawl_query_worker(city: str, query: str, max_price: int, max_results: int, 
 
             # Get the item URL using multiple strategies
             post_url = find_listing_url(listing)
+
+            # FOR TANYA PURPOSES collecting VHS stack images for OCR and YOLO training. PAUSED TEMPORARILY uncomment to continue
+            # vhs_lot_keywords = ["vhs tapes", "vhs lot", "lots of vhs", "vhs movies", "bulk vhs"]
+            # if image and any(sub in title.lower() for sub in vhs_lot_keywords):
+            #   save_listing_image(
+            #       image_url=image,
+            #       listing_id=extract_item_id(post_url) # TODO: NOW do not save dupes
+            #   )
 
             # Check if listing has "Just listed" pill
             has_just_listed_pill = find_just_listed_pill(listing)
@@ -603,10 +619,10 @@ def crawl_query_worker(city: str, query: str, max_price: int, max_results: int, 
             logger.error(f"Failed to restart browser in worker: {restart_error}")
         return []  # Return empty results instead of crashing
 
-def crawl_query_with_playwright(city: str, query: str, max_price: int, max_results: int, suggested: bool):
+def crawl_query_with_playwright(city: str, radius: int, query: str, max_price: int, max_results: int, suggested: bool):
     """Alternative approach - now also uses worker thread system"""
     # This function now just calls the main crawl_query which uses the worker
-    return crawl_query(city, query, max_price, max_results, suggested)
+    return crawl_query(city, radius, query, max_price, max_results, suggested)
 
 def find_marketplace_listings(soup):
     """Find marketplace listings using multiple strategies."""
@@ -965,6 +981,29 @@ def load_notified_items():
     
     return set()
 
+def save_listing_image(image_url, listing_id):
+    try:
+        date_folder = IMAGE_ROOT / datetime.now().strftime("%Y-%m-%d")
+        date_folder.mkdir(parents=True, exist_ok=True)
+
+        filename = f"{listing_id}.jpg"
+        filepath = date_folder / filename
+
+        if filepath.exists():
+            return str(filepath)
+
+        r = requests.get(image_url, timeout=10)
+        r.raise_for_status()
+
+        with open(filepath, "wb") as f:
+            f.write(r.content)
+
+        return str(filepath)
+
+    except Exception as e:
+        logger.error(f"Failed to save image {image_url}: {e}")
+        return None
+    
 def save_notified_items(notified_items_dict):
     """Save the dictionary of notified item IDs with timestamps"""
     try:
