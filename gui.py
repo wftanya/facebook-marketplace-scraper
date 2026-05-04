@@ -11,7 +11,9 @@ from pathlib import Path
 from pathlib import Path
 
 # Configure page to use full width - must be first Streamlit command
-st.set_page_config(page_title="DingBot™ Facebook Scraper", layout="wide")
+# st.set_page_config(page_title="DingBot™ FB Marketplace Scraper", layout="wide")
+# TODO: temp title for incognito
+st.set_page_config(page_title="Tanya", layout="wide")
 
 # Notification tracking (same as backend)
 NOTIFICATION_TRACKING_FILE = "hot_items_notifications.json"

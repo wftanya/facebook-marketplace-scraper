@@ -59,3 +59,5 @@ This program can be customized to your personal/organizational needs. For more i
 - Not getting results? Try chagning `headless=False` in the code to see what's
 going on. Usually it's a case of Facebook forcing you to sign in. I find that
 as long as I am not running a VPN, sign in is not required.
+
+- Getting constant about:blank refreshes in Chromium browser? Turn off VPN

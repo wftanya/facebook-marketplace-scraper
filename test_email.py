@@ -78,7 +78,8 @@ def send_test_email():
         success = send_hot_item_email(
             hot_items=test_hot_items,
             query="Test Query",
-            city="TestCity"
+            city="TestCity",
+            radius=100
         )
         
         if success:

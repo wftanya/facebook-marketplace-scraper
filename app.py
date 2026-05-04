@@ -452,7 +452,7 @@ def crawl_facebook_marketplace(city: str, radius: int, query: str, max_price: in
       hot_items = [item for item in consolidated_query_results if item.get('item_type') == 'hot']
       new_hot_items = [item for item in hot_items if extract_item_id(item["link"]) not in notified_items]
       if new_hot_items:
-          send_hot_item_email(new_hot_items, query, city)
+          send_hot_item_email(new_hot_items, query, city, radius)
           new_hot_item_ids = [extract_item_id(item["link"]) for item in new_hot_items]
           add_notified_items(new_hot_item_ids)
 
@@ -618,6 +618,32 @@ def crawl_query_worker(city: str, radius: int, query: str, max_price: int, max_r
         except Exception as restart_error:
             logger.error(f"Failed to restart browser in worker: {restart_error}")
         return []  # Return empty results instead of crashing
+    # TODO: crash handle, just get in loop of about blank chromium
+#     ERROR:app:Login error in worker: Page crashed
+# ERROR:app:Error during crawl in worker
+# Traceback (most recent call last):  
+#   File "/Users/hifyre/Codes/facebook-marketplace-scraper/app.py", line 520, in crawl_query_worker
+#     login_and_goto_marketplace_worker(initial_url, marketplace_url)
+#   File "/Users/hifyre/Codes/facebook-marketplace-scraper/app.py", line 292, in login_and_goto_marketplace_worker
+#     raise e
+#   File "/Users/hifyre/Codes/facebook-marketplace-scraper/app.py", line 230, in login_and_goto_marketplace_worker
+#     page.goto(initial_url)
+#   File "/Users/hifyre/.pyenv/versions/3.9.6/lib/python3.9/site-packages/playwright/sync_api/_generated.py", line 9312, in goto
+#     self._sync(
+#   File "/Users/hifyre/.pyenv/versions/3.9.6/lib/python3.9/site-packages/playwright/_impl/_sync_base.py", line 115, in _sync
+#     return task.result()
+#   File "/Users/hifyre/.pyenv/versions/3.9.6/lib/python3.9/site-packages/playwright/_impl/_page.py", line 475, in goto
+#     return await self._main_frame.goto(**locals_to_params(locals()))
+#   File "/Users/hifyre/.pyenv/versions/3.9.6/lib/python3.9/site-packages/playwright/_impl/_frame.py", line 139, in goto
+#     await self._channel.send("goto", locals_to_params(locals()))
+#   File "/Users/hifyre/.pyenv/versions/3.9.6/lib/python3.9/site-packages/playwright/_impl/_connection.py", line 62, in send
+#     return await self._connection.wrap_api_call(
+#   File "/Users/hifyre/.pyenv/versions/3.9.6/lib/python3.9/site-packages/playwright/_impl/_connection.py", line 492, in wrap_api_call
+#     return await cb()
+#   File "/Users/hifyre/.pyenv/versions/3.9.6/lib/python3.9/site-packages/playwright/_impl/_connection.py", line 100, in inner_send
+#     result = next(iter(done)).result()
+# playwright._impl._errors.Error: Page crashed
+# WARNING:app:Restarting browser in worker thread...
 
 def crawl_query_with_playwright(city: str, radius: int, query: str, max_price: int, max_results: int, suggested: bool):
     """Alternative approach - now also uses worker thread system"""
@@ -845,7 +871,7 @@ EMAIL_SENDER = os.getenv('GMAIL_SENDER', '')  # Your Gmail address
 EMAIL_PASSWORD = os.getenv('GMAIL_APP_PASSWORD', '')  # Your Gmail App Password
 EMAIL_RECIPIENTS = os.getenv('EMAIL_RECIPIENTS', '').split(',')  # Comma-separated recipient emails
 
-def send_hot_item_email(hot_items, query, city):
+def send_hot_item_email(hot_items, query, city, radius):
     """Send email notification for HOT items found"""
     logger.info(f"Preparing to send email for {len(hot_items)} HOT items found in {city} for query '{query}'")
     if not EMAIL_SENDER or not EMAIL_PASSWORD or not EMAIL_RECIPIENTS[0]:
@@ -906,7 +932,7 @@ def send_hot_item_email(hot_items, query, city):
         text_content = f"""
 HOT ITEMS ALERT!
 
-Found {len(hot_items)} hot item{'s' if len(hot_items) > 1 else ''} in {city} for "{query}"
+Found {len(hot_items)} hot item{'s' if len(hot_items) > 1 else ''} in {city} with radius {radius} for "{query}"
 {datetime.now().strftime('%B %d, %Y at %I:%M %p')}
 
 """
