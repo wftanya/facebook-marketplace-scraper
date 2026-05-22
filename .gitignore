@@ -2,3 +2,4 @@ fb_profile/
 __pycache__/
 .env
 data/images/
+venv/

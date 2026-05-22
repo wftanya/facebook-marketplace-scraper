@@ -314,7 +314,7 @@ query = st.text_input("Query (comma,between,multiple,queries)", "VHS", key='quer
 max_price = st.text_input("Max Price ($)", "9999", key='max_price')
 # This value should be calibrated to your queries. Facebook sometimes is very lax about what they think
 # is related to your search query.
-max_listings = st.text_input("Max Latest Listings", "20", key='max_listings')
+max_listings = st.text_input("Max Latest Listings", "100", key='max_listings')
 
 countdown_message = st.empty()
 

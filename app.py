@@ -11,6 +11,7 @@
 from playwright.sync_api import sync_playwright, Page
 # The os library is used to get the environment variables.
 import os
+import glob
 # The time library is used to add a delay to the script.
 import time
 # The BeautifulSoup library is used to parse the HTML.
@@ -152,12 +153,14 @@ def initialize_browser_worker(headless=True):
                 user_data_dir="fb_profile",  # Persistent user data directory
                 headless=headless,
                 args=[
-                    '--enable-logging', 
+                    '--enable-logging',
                     '--v=1',
                     '--no-first-run',
                     '--disable-blink-features=AutomationControlled',
                     '--disable-web-security',
-                    '--allow-running-insecure-content'
+                    '--allow-running-insecure-content',
+                    '--disable-gpu',
+                    '--disable-dev-shm-usage',
                 ]
             )
             # For persistent context, browser acts as both browser and page context
@@ -295,14 +298,23 @@ def restart_browser_worker():
     """Worker thread version of browser restart - starts in headless mode by default"""
     global browser, page
     logger.warning("Restarting browser in worker thread...")
-    
-    # Clean up existing resources
+
     cleanup_browser_resources_worker()
-    
-    # Try to initialize browser once - start headless by default
+
+    # Remove stale Chromium lock files left behind after a hard crash.
+    # Without this the new instance sees a locked profile and crashes immediately.
+    for lock_file in glob.glob("fb_profile/SingletonLock") + glob.glob("fb_profile/.org.chromium.Chromium.*"):
+        try:
+            os.remove(lock_file)
+            logger.info(f"Removed stale lock file: {lock_file}")
+        except OSError:
+            pass
+
+    time.sleep(3)  # let the OS fully release file handles before relaunching
+
     try:
         initialize_browser_worker(headless=False)
-        logger.info("Browser restarted successfully in worker thread (headless mode)")
+        logger.info("Browser restarted successfully in worker thread")
     except Exception as e:
         logger.error(f"Failed to restart browser in worker thread: {e}")
         raise e
@@ -369,6 +381,7 @@ def crawl_facebook_marketplace(city: str, radius: int, query: str, max_price: in
       try:
         # Use the new robust crawling method
         recent_query_results = crawl_query(city, radius, query, max_price, max_results_per_query, False)
+        print(recent_query_results, "The recent query results. is it always empty?")
         suggested_results = crawl_query(city, radius, query, max_price, max_results_per_query, True)
       except Exception as e:
         logger.error(f"Error crawling query '{query}': {e}")
@@ -386,37 +399,39 @@ def crawl_facebook_marketplace(city: str, radius: int, query: str, max_price: in
 
       # Add metadata to indicate item type based on new requirements:
       # Priority order: 
-      # 1. HOT: Items in both recent AND suggested (common items)
+      # 1. HOT: Items in both recent AND suggested (common items) AND
+      # have the query in the title OR have a "hot" keyword like FREE
       # 2. NEW: Recent-only items with "just listed" pill
       # 3. SUGGESTED: Suggested-only items without "just listed" pill
       # 4. No badge: Recent-only items without "just listed" pill
       
-      # First, assign basic types
+      query_words = query.lower().split()
+
       for item in recent_query_results:
         item_id = extract_item_id(item["link"])
-        if query.lower() in item["title"].lower(): # Trying to catch recent relevant listings that haven't appeared in suggested yet
-            print("Flagged recent item as hot based on query match:", item["title"])
-            item["item_type"] == "hot"
-        elif any(word in item["title"].lower() for word in HOT_KEYWORDS): # Trying to catch recent relevant listings that haven't appeared in suggested yet
-            item["item_type"] == "hot"
-        # TODO: common items as hot items logic isn't quite right since it is notifying us of old listings. Some listings are in recent but later appear in suggested and vice versa for some reason on FB's end.
-        # TODO: above may be due to FB marketplace's recent query not being accurate anymore.. Nov 27 2025
-        if item_id in common_item_ids:
-          item["item_type"] = "hot"  # Items in both recent AND suggested = HOT
-        elif item.get('has_just_listed_pill', True):
-          item["item_type"] = "new"  # Recent-only with "just listed" pill
+        title_lower = item["title"].lower()
+        title_matches = all(word in title_lower for word in query_words)
+        has_hot_keyword = any(word in title_lower for word in HOT_KEYWORDS)
+
+        # HOT: must appear in BOTH lists and title must contain all query words (or a HOT_KEYWORD)
+        if item_id in common_item_ids and (title_matches or has_hot_keyword):
+          item["item_type"] = "hot"
+        elif item.get('has_just_listed_pill', False):
+          item["item_type"] = "new"
         else:
-          item["item_type"] = "recent"  # Recent-only without "just listed" pill
+          item["item_type"] = "recent"
 
       for item in suggested_results:
         item_id = extract_item_id(item["link"])
-        # TODO: Old listings slipping thru the cracks with this, suggested listings only being suggested after some time has passed since the listing was made
-        if item_id in common_item_ids:
-          item["item_type"] = "hot"  # Items in both recent AND suggested = HOT
-        if item.get('has_just_listed_pill', True):
-          item["item_type"] = "hot"  # Suggested with "just listed" pill also = HOT
+        title_lower = item["title"].lower()
+        title_matches = all(word in title_lower for word in query_words)
+        has_hot_keyword = any(word in title_lower for word in HOT_KEYWORDS)
+
+        # HOT: must appear in BOTH lists and title must contain all query words (or a HOT_KEYWORD)
+        if item_id in common_item_ids and (title_matches or has_hot_keyword):
+          item["item_type"] = "hot"
         else:
-          item["item_type"] = "suggested"  # Suggested-only without "just listed" pill
+          item["item_type"] = "suggested"
 
       # Create consolidated results using item IDs to avoid duplicates
       all_items_by_id = {}
@@ -522,6 +537,17 @@ def crawl_query_worker(city: str, radius: int, query: str, max_price: int, max_r
         # Get listings of particular item in a particular city for a particular price.
         # Wait for the page to load.
         time.sleep(5)
+
+        # Scroll to trigger lazy-loaded listings, stop early if the page stops growing.
+        last_height = page.evaluate("document.body.scrollHeight")
+        for _ in range(8):
+            page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            time.sleep(1.5)
+            new_height = page.evaluate("document.body.scrollHeight")
+            if new_height == last_height:
+                break
+            last_height = new_height
+
         html = page.content()
         soup = BeautifulSoup(html, 'html.parser')
         parsed = []
@@ -534,18 +560,18 @@ def crawl_query_worker(city: str, radius: int, query: str, max_price: int, max_r
             image = find_listing_image(listing)
             
             # Get the item title using multiple strategies
-            title = find_listing_title(listing)
+            title = find_listing_title(listing) or ""
 
             # Get the item URL using multiple strategies
             post_url = find_listing_url(listing)
 
             # FOR TANYA PURPOSES collecting VHS stack images for OCR and YOLO training. PAUSED TEMPORARILY uncomment to continue
-            # vhs_lot_keywords = ["vhs tapes", "vhs lot", "lots of vhs", "vhs movies", "bulk vhs"]
-            # if image and any(sub in title.lower() for sub in vhs_lot_keywords):
-            #   save_listing_image(
-            #       image_url=image,
-            #       listing_id=extract_item_id(post_url) # TODO: NOW do not save dupes
-            #   )
+            vhs_lot_keywords = ["vhs tapes", "vhs lot", "lots of vhs", "vhs movies", "vhs collection", "bulk vhs"]
+            if image and any(sub in title.lower() for sub in vhs_lot_keywords):
+              save_listing_image(
+                  image_url=image,
+                  listing_id=extract_item_id(post_url) # TODO: NOW do not save dupes
+              )
 
             # Check if listing has "Just listed" pill
             has_just_listed_pill = find_just_listed_pill(listing)
@@ -588,7 +614,6 @@ def crawl_query_worker(city: str, radius: int, query: str, max_price: int, max_r
 
         for item in parsed:
             # Determine item type based on suggested flag and "just listed" pill
-            # TODO: I don't think just listed pill is a thing anymore, at least in list view
             if suggested and item['has_just_listed_pill']:
                 item_type = 'hot'  # 🔥 HOT items: Suggested results with "Just listed" pill
             elif not suggested and item['has_just_listed_pill']:
@@ -651,42 +676,26 @@ def crawl_query_with_playwright(city: str, radius: int, query: str, max_price: i
     return crawl_query(city, radius, query, max_price, max_results, suggested)
 
 def find_marketplace_listings(soup):
-    """Find marketplace listings using multiple strategies."""
-    # Strategy 1: Look for divs that contain both an image and a link (common marketplace pattern)
-    listings = soup.find_all('div', lambda value: value and len(value.split()) > 10)  # Divs with many classes
-    
-    # Filter to only divs that contain both an image and a link
-    marketplace_listings = []
-    for listing in listings:
-        has_image = listing.find('img') is not None
-        has_link = listing.find('a') is not None
-        if has_image and has_link:
-            marketplace_listings.append(listing)
-    
-    # Strategy 2: If no listings found, try a broader search
-    if not marketplace_listings:
-        # Look for any div containing marketplace-like content
-        all_divs = soup.find_all('div')
-        for div in all_divs:
-            img = div.find('img')
-            link = div.find('a')
-            if img and link and img.get('src') and link.get('href'):
-                # Check if the link looks like a marketplace item
-                href = link.get('href', '')
-                if '/marketplace/item/' in href or 'marketplace' in href:
-                    marketplace_listings.append(div)
-    
-    # Fallback: Use configurable selectors to find listings
-    if not marketplace_listings and 'FALLBACK_SELECTORS' in globals():
-        for selector in FALLBACK_SELECTORS['listings']:
-            listings = soup.select(selector)
-            for listing in listings:
-                if listing not in marketplace_listings:
-                    marketplace_listings.append(listing)
-            if marketplace_listings:
-                break
-    
-    return marketplace_listings
+    """Find individual marketplace listing anchors by href pattern.
+
+    Returns each unique <a href="/marketplace/item/..."> tag as the listing
+    object. Downstream extractors handle both <a> tags and container divs.
+    """
+    seen_ids = set()
+    listings = []
+    for a in soup.find_all('a', href=True):
+        href = a.get('href', '')
+        if '/marketplace/item/' not in href:
+            continue
+        try:
+            item_id = href.split('/marketplace/item/')[1].split('/')[0].split('?')[0]
+        except IndexError:
+            continue
+        if not item_id or item_id in seen_ids:
+            continue
+        seen_ids.add(item_id)
+        listings.append(a)
+    return listings
 
 def find_listing_image(listing):
     """Find the image URL using multiple strategies."""
@@ -713,16 +722,33 @@ def find_listing_image(listing):
 
 def find_listing_title(listing):
     """Find the listing title using multiple strategies."""
-    # Strategy 1: Look for span elements with text content
-    spans = listing.find_all('span')
-    for span in spans:
+    # Strategy 1: aria-label on the <a> tag — most reliable, format:
+    # "Title, Price, Location, listing ID"
+    anchor = listing if listing.name == 'a' else listing.find('a', href=lambda h: h and '/marketplace/item/' in h)
+    if anchor:
+        aria = anchor.get('aria-label', '')
+        if aria:
+            parts = aria.split(', ')
+            if parts and len(parts[0]) > 2:
+                return parts[0]
+
+    # Strategy 2: img alt text — format: "Title in City, Province"
+    img = listing.find('img', attrs={'alt': True})
+    if img:
+        alt = img.get('alt', '')
+        if alt and len(alt) > 5:
+            return alt.rsplit(' in ', 1)[0] if ' in ' in alt else alt
+
+    # Strategy 3: span text, skipping known non-title content
+    SKIP_PHRASES = ['$', 'price', 'location', 'see more', 'show more',
+                    'just listed', 'just now', 'new listing', 'recently listed']
+    for span in listing.find_all('span'):
         text = span.get_text(strip=True)
-        if text and len(text) > 5 and len(text) < 200:  # Reasonable title length
-            # Skip common UI elements
-            if not any(skip in text.lower() for skip in ['$', 'price', 'location', 'see more', 'show more']):
+        if text and 5 < len(text) < 200:
+            if not any(skip in text.lower() for skip in SKIP_PHRASES):
                 return text
-    
-    # Strategy 2: Look for any text in links
+
+    # Strategy 4: Look for any text in links
     links = listing.find_all('a')
     for link in links:
         text = link.get_text(strip=True)
@@ -749,21 +775,26 @@ def find_listing_title(listing):
 
 def find_listing_url(listing):
     """Find the listing URL using multiple strategies."""
-    # Strategy 1: Look for links that go to marketplace items
+    # Strategy 1: listing IS the <a> tag (from anchor-based find_marketplace_listings)
+    if listing.name == 'a':
+        href = listing.get('href', '')
+        if '/marketplace/item/' in href:
+            if href.startswith('/'):
+                return 'https://www.facebook.com' + href
+            return href
+
+    # Strategy 2: Look for a child <a> that goes to a marketplace item
     links = listing.find_all('a')
     for link in links:
-        href = link.get('href')
-        if href:
-            # Make sure it's a marketplace item link
-            if '/marketplace/item/' in href or 'marketplace' in href:
-                # Convert relative URLs to absolute
-                if href.startswith('/'):
-                    href = 'https://www.facebook.com' + href
-                return href
-    
-    # Strategy 2: Look for any link that might be the main item link
+        href = link.get('href', '')
+        if '/marketplace/item/' in href:
+            if href.startswith('/'):
+                href = 'https://www.facebook.com' + href
+            return href
+
+    # Strategy 3: Any facebook.com link as a fallback
     for link in links:
-        href = link.get('href')
+        href = link.get('href', '')
         if href and href.startswith('https://www.facebook.com'):
             return href
     
