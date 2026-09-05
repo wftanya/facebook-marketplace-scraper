@@ -45,11 +45,70 @@ from dotenv import load_dotenv
 LOG_PATH = "marketplace_log.jsonl"
 DATE_MARKER_PATH = "marketplace_log_date.txt"
 HOT_KEYWORDS = ["free"]
+QUERY_EXPANSIONS_FILE = "query_expansions.json"
 
 IMAGE_ROOT = Path("data/images")
 
 # Load environment variables
 load_dotenv()
+
+
+def load_query_expansions() -> dict:
+    """Load the query → related-phrases cache from disk."""
+    try:
+        with open(QUERY_EXPANSIONS_FILE, 'r') as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def get_related_queries(query: str) -> list:
+    """Return cached related phrases for a query.
+
+    Looks up query_expansions.json first.  When OpenAI is ready, replace the
+    stub block below to auto-generate and persist expansions for new queries.
+    """
+    expansions = load_query_expansions()
+    key = query.lower().strip()
+
+    if key in expansions:
+        return expansions[key]
+
+    # --- OpenAI stub (not yet wired) ---
+    # Uncomment and implement when ready:
+    #
+    # related = openai_generate_related_queries(query)   # your API call here
+    # expansions[key] = related
+    # with open(QUERY_EXPANSIONS_FILE, 'w') as f:
+    #     json.dump(expansions, f, indent=2)
+    # return related
+    # ------------------------------------
+
+    return []
+
+
+def title_matches_query(title: str, query: str) -> bool:
+    """Return True if the title matches the query or any of its related phrases.
+
+    Every word in a candidate phrase must appear in the title (order-independent),
+    so "Horror VHS" matches "Horror VHS Lot" and also "Scary VHS" via expansions.
+    """
+    title_lower = title.lower()
+    for phrase in [query] + get_related_queries(query):
+        if all(word in title_lower for word in phrase.lower().split()):
+            return True
+    return False
+
+
+def parse_blacklist_terms(blacklist_terms: str) -> list:
+    """Split a comma-separated blacklist string into lowercase, stripped terms."""
+    return [t.strip().lower() for t in blacklist_terms.split(',') if t.strip()]
+
+
+def title_is_blacklisted(title: str, blacklist_terms: list) -> bool:
+    """Return True if any blacklist term appears in the title."""
+    title_lower = title.lower()
+    return any(term in title_lower for term in blacklist_terms)
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -350,7 +409,7 @@ def root():
 # Define a function to be executed when the endpoint is called.
 # Add a description to the function.
 # TODO: days since listed input
-def crawl_facebook_marketplace(city: str, radius: int, query: str, max_price: int, max_results_per_query: int):
+def crawl_facebook_marketplace(city: str, radius: int, query: str, max_price: int, max_results_per_query: int, recent_only: bool = False, blacklist_terms: str = ""):
     # Define dictionary of cities from the facebook marketplace directory for United States.
     # https://m.facebook.com/marketplace/directory/US/?_se_imp=0oey5sMRMSl7wluQZ
     print(city)
@@ -377,16 +436,23 @@ def crawl_facebook_marketplace(city: str, radius: int, query: str, max_price: in
     # Split the query into a list
     query_list = query.split(',')
     notified_items = load_notified_items()
+    blacklist_list = parse_blacklist_terms(blacklist_terms)
     for query in query_list:
       try:
         # Use the new robust crawling method
         recent_query_results = crawl_query(city, radius, query, max_price, max_results_per_query, False)
         print(recent_query_results, "The recent query results. is it always empty?")
-        suggested_results = crawl_query(city, radius, query, max_price, max_results_per_query, True)
+        suggested_results = [] if recent_only else crawl_query(city, radius, query, max_price, max_results_per_query, True)
       except Exception as e:
         logger.error(f"Error crawling query '{query}': {e}")
         recent_query_results = []
         suggested_results = []
+
+      # Drop blacklisted listings before any hot/notification logic sees them,
+      # so blacklisted titles never trigger a ding or email alert.
+      if blacklist_list:
+        recent_query_results = [item for item in recent_query_results if not title_is_blacklisted(item["title"], blacklist_list)]
+        suggested_results = [item for item in suggested_results if not title_is_blacklisted(item["title"], blacklist_list)]
 
       # Extract item IDs for comparison instead of full URLs
       recent_query_item_ids = {extract_item_id(item["link"]): item for item in recent_query_results if extract_item_id(item["link"])}
@@ -405,15 +471,14 @@ def crawl_facebook_marketplace(city: str, radius: int, query: str, max_price: in
       # 3. SUGGESTED: Suggested-only items without "just listed" pill
       # 4. No badge: Recent-only items without "just listed" pill
       
-      query_words = query.lower().split()
+
 
       for item in recent_query_results:
         item_id = extract_item_id(item["link"])
-        title_lower = item["title"].lower()
-        title_matches = all(word in title_lower for word in query_words)
-        has_hot_keyword = any(word in title_lower for word in HOT_KEYWORDS)
+        title_matches = title_matches_query(item["title"], query)
+        has_hot_keyword = any(word in item["title"].lower() for word in HOT_KEYWORDS)
 
-        # HOT: must appear in BOTH lists and title must contain all query words (or a HOT_KEYWORD)
+        # HOT: must appear in BOTH lists and title must match query or a related phrase (or a HOT_KEYWORD)
         if item_id in common_item_ids and (title_matches or has_hot_keyword):
           item["item_type"] = "hot"
         elif item.get('has_just_listed_pill', False):
@@ -423,15 +488,22 @@ def crawl_facebook_marketplace(city: str, radius: int, query: str, max_price: in
 
       for item in suggested_results:
         item_id = extract_item_id(item["link"])
-        title_lower = item["title"].lower()
-        title_matches = all(word in title_lower for word in query_words)
-        has_hot_keyword = any(word in title_lower for word in HOT_KEYWORDS)
+        title_matches = title_matches_query(item["title"], query)
+        has_hot_keyword = any(word in item["title"].lower() for word in HOT_KEYWORDS)
 
         # HOT: must appear in BOTH lists and title must contain all query words (or a HOT_KEYWORD)
         if item_id in common_item_ids and (title_matches or has_hot_keyword):
           item["item_type"] = "hot"
         else:
           item["item_type"] = "suggested"
+
+      # "Just listed" items that match the query are always HOT
+      for item in recent_query_results:
+        if item.get("item_type") == "new":
+          title_matches = title_matches_query(item["title"], query)
+          has_hot_keyword = any(word in item["title"].lower() for word in HOT_KEYWORDS)
+          if title_matches or has_hot_keyword:
+            item["item_type"] = "hot"
 
       # Create consolidated results using item IDs to avoid duplicates
       all_items_by_id = {}
@@ -576,9 +648,10 @@ def crawl_query_worker(city: str, radius: int, query: str, max_price: int, max_r
             # Check if listing has "Just listed" pill
             has_just_listed_pill = find_just_listed_pill(listing)
 
-            # Only add the item if the title includes any of the query terms
-            query_parts = query.split(' ')
-            if title is not None and post_url is not None and image is not None and any(part.lower() in title.lower() for part in query_parts):
+            # Only filter by title when we actually extracted one — empty titles pass through
+            # so valid listings with failed title extraction aren't silently dropped.
+            title_ok = not title or title_matches_query(title, query)
+            if post_url is not None and image is not None and title_ok:
                 # Append the parsed data to the list.
                 parsed.append({
                     'image': image,

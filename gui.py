@@ -1,19 +1,17 @@
 import random
 import streamlit as st
-import schedule
 import streamlit.components.v1 as stcomponents
 import time
-import json 
+import json
 import requests
-from datetime import time as datetime_time, datetime
+from datetime import datetime
 from PIL import Image
 from pathlib import Path
-from pathlib import Path
+
+from scraper_config import read_state, write_state
 
 # Configure page to use full width - must be first Streamlit command
-# st.set_page_config(page_title="DingBot™ FB Marketplace Scraper", layout="wide")
-# TODO: temp title for incognito
-st.set_page_config(page_title="Tanya", layout="wide")
+st.set_page_config(page_title="DingBot™ FB Marketplace Scraper", layout="wide")
 
 # Notification tracking (same as backend)
 NOTIFICATION_TRACKING_FILE = "hot_items_notifications.json"
@@ -89,28 +87,10 @@ def extract_item_id(url):
     # If no pattern matches, use the full URL as fallback (shouldn't happen but safe)
     return url
 
-def countdown_timer():
-  countdown_message.empty()
-  duration = 5 * 60  # Every 5 minutes
-  while duration:
-        mins, secs = divmod(duration, 60)
-        timeformat = '{:02d}:{:02d}'.format(mins, secs)
-        countdown_message.text(f"Time until next auto scrape: {timeformat}")
-        time.sleep(1)
-        duration -= 1
-  countdown_message.text("Scraping...")
-
-
 def ding():
   unique_id = f'dingSound_{time.time()}_{random.randint(1, 1000)}'
   audio_html = f'<audio id="{unique_id}" autoplay><source src="app/static/ding.mp3"></audio>'
   stcomponents.html(audio_html)
-
-def maybe_crawl():
-  if datetime.now().time() > datetime_time(6, 0):
-    crawl()
-  else:
-    print("Paused until 6AM") # TODO: To constant
 
 def crawl():  # Get current values from Streamlit widgets instead of global variables
   current_city = st.session_state.get('city', city)
@@ -118,19 +98,9 @@ def crawl():  # Get current values from Streamlit widgets instead of global vari
   current_query = st.session_state.get('query', query)
   current_max_price = st.session_state.get('max_price', max_price)
   current_max_listings = st.session_state.get('max_listings', max_listings)
+  current_recent_only = st.session_state.get('recent_only', False)
+  current_blacklist_terms = st.session_state.get('blacklist_terms', '')
 
-  # Workaround to hide the ugly iframe that the new results alert component gets rendered in
-  st.markdown(
-    """
-    <style>
-        iframe {
-            display: none;  /* Hide the iframe */
-        }
-    </style>
-    """,
-    unsafe_allow_html=True
-  )
-  
   if "," in current_max_price:
       current_max_price = current_max_price.replace(",", "")
   elif "$" in current_max_price:
@@ -147,7 +117,7 @@ def crawl():  # Get current values from Streamlit widgets instead of global vari
   # Get results for each query individually
   for individual_query in query_list:
     try:
-      res = requests.get(f"http://127.0.0.1:8000/crawl_facebook_marketplace?city={current_city}&radius={current_radius}&sortBy=creation_time_descend&query={individual_query}&max_price={str(int(current_max_price) * 100)}&max_results_per_query={current_max_listings}")
+      res = requests.get(f"http://127.0.0.1:8000/crawl_facebook_marketplace?city={current_city}&radius={current_radius}&sortBy=creation_time_descend&query={individual_query}&max_price={str(int(current_max_price) * 100)}&max_results_per_query={current_max_listings}&recent_only={str(current_recent_only).lower()}&blacklist_terms={current_blacklist_terms}")
       query_results = res.json()
       results_by_query[individual_query] = query_results
     except:
@@ -291,8 +261,6 @@ def crawl():  # Get current values from Streamlit widgets instead of global vari
             st.markdown("---")
         st.markdown('</div>', unsafe_allow_html=True)  # Close results container
 
-  countdown_timer()
-
 # End of private functions
 
 # Initialize session state
@@ -309,17 +277,51 @@ supported_cities = ["Hamilton", "104045032964460", "Barrie", "Toronto"] # TODO: 
 # Take user input for the city, query, and max price.
 city = st.selectbox("City", supported_cities, 0, key='city')
 radius = st.selectbox("Radius (km)", [1, 2, 5, 10, 20, 40, 60, 80, 100, 250, 500], 9, key='radius')
-query = st.text_input("Query (comma,between,multiple,queries)", "VHS", key='query')
+query = st.text_input("Query (comma,between,multiple,queries)", "Horror VHS", key='query')
 # TODO: don't scrape until there is an input. Ensure that subsequent auto scrapes use the input
 max_price = st.text_input("Max Price ($)", "9999", key='max_price')
 # This value should be calibrated to your queries. Facebook sometimes is very lax about what they think
 # is related to your search query.
 max_listings = st.text_input("Max Latest Listings", "100", key='max_listings')
+recent_only = st.checkbox("Scrape recent listings only (reduces alert noise)", False, key='recent_only')
+blacklist_terms = st.text_input("Blacklist terms (comma,separated) - listings with these words in the title are excluded", "", key='blacklist_terms')
+
+# The background worker (worker.py) reads scraper_state.json on its own schedule.
+# We only write to it on an explicit click - never on every rerun - so a stale
+# browser tab left open with an old query can't silently clobber the worker's
+# config just by reconnecting.
+current_inputs = dict(
+    city=city,
+    radius=radius,
+    query=query,
+    max_price=max_price,
+    max_listings=max_listings,
+    recent_only=recent_only,
+    blacklist_terms=blacklist_terms,
+)
 
 countdown_message = st.empty()
 
-# TODO: shouldn't clear results
-submit = st.button("Force Scrape Now!")
+live = read_state()
+live_inputs = {k: live.get(k) for k in current_inputs}
+if live_inputs == current_inputs:
+    countdown_message.info(
+        f"Background worker is using this query: **{live.get('query')}**. "
+        "Auto-scraping runs in `python worker.py`."
+    )
+else:
+    countdown_message.warning(
+        f"These inputs are NOT applied yet. Background worker is still using: "
+        f"**{live.get('query')}**. Click **Apply settings to worker** below."
+    )
+
+col_apply, col_scrape = st.columns(2)
+apply_settings = col_apply.button("Apply settings to worker")
+submit = col_scrape.button("Force Scrape Now!")
+
+if apply_settings:
+    write_state(**current_inputs)
+    st.success(f"Applied. Worker will use query: {query}")
 
 results_message = st.empty()
 results_container = st.empty()
@@ -328,16 +330,3 @@ results_container = st.empty()
 if submit:
   countdown_message.text("Scraping...")
   crawl()
-
-# Schedule the scraper to run every 5-7 minutes, pausing overnight
-variable_interval = random.randint(5, 8) # Add some randomness to avoid being too "bot-like"
-schedule.every(variable_interval).minutes.do(maybe_crawl)
-
-# Timer message
-countdown_timer() # TODO: FIRST auto scrape not working?
-# TODO: countdown timer message to reflect paused overnight
-
-# Run the scheduler
-while True:
-  schedule.run_pending()
-  time.sleep(2)  # Sleep for 1 second to avoid high CPU usage

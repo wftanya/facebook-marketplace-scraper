@@ -3,3 +3,5 @@ __pycache__/
 .env
 data/images/
 venv/
+scraper_state.json
+scraper_state.json.tmp
